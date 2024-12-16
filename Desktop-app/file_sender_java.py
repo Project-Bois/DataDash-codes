@@ -1,5 +1,7 @@
 import json
 import platform
+import tempfile
+from pathlib import Path
 from PyQt6.QtWidgets import (
     QMessageBox, QWidget, QVBoxLayout, QPushButton, QListWidget, 
     QProgressBar, QLabel, QFileDialog, QApplication, QListWidgetItem, QTextEdit, QLineEdit, QHBoxLayout, QFrame
@@ -9,16 +11,16 @@ import os
 import socket
 import struct
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
-from constant import BROADCAST_ADDRESS, BROADCAST_PORT, LISTEN_PORT, get_config, logger
+from constant import get_config, logger
 from crypt_handler import encrypt_file
 from time import sleep
 
-SENDER_DATA = 57000
-RECEIVER_DATA = 58100
+RECEIVER_DATA = 57341
 
 class FileSenderJava(QThread):
     progress_update = pyqtSignal(int)
     file_send_completed = pyqtSignal(str)
+    transfer_finished = pyqtSignal()
     config = get_config()
     password = None
 
@@ -31,35 +33,24 @@ class FileSenderJava(QThread):
         #com.an.Datadash
 
     def initialize_connection(self):
-        # Ensure previous socket is closed before re-binding
         try:
             if hasattr(self, 'client_skt'):
                 self.client_skt.close()
                 logger.debug("Socket closed successfully before rebinding.")
-            sleep(1)  # Delay to ensure the OS releases the port
-        except Exception as e:
-            logger.error(f"Error closing socket: {e}")
-        
-        # Create a new TCP socket
-        self.client_skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.client_skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Use dynamic port assignment to avoid WinError 10048
-        try:
-            self.client_skt.bind(('', 0))  # Bind to any available port assigned by the OS
-            logger.debug(f"Bound to port {self.client_skt.getsockname()[1]}")  # Log the assigned port for debugging
-            self.client_skt.connect((self.ip_address, RECEIVER_DATA))  # Connect to receiver's IP and port
-            logger.debug(f"Successfully connected to {self.ip_address} on port {RECEIVER_DATA}")
-        except ConnectionRefusedError:
-            logger.error("Connection refused: Failed to connect to the specified IP address.")
-            self.show_message_box("Connection Error", "Failed to connect to the specified IP address.")
+            sleep(1)  # Wait for socket cleanup
+            
+            self.client_skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.client_skt.settimeout(30)  # 30 second timeout
+            
+            self.client_skt.connect((self.ip_address, 57341))
+            logger.debug(f"Successfully connected to {self.ip_address} on port 57341")
+            return True
+            
+        except (ConnectionRefusedError, OSError) as e:
+            logger.error(f"Connection failed: {e}")
+            self.show_message_box("Connection Error", f"Failed to connect: {e}")
             return False
-        except OSError as e:
-            logger.error(f"Binding error: {e}")
-            self.show_message_box("Binding Error", f"Failed to bind to the specified port: {e}")
-            return False
-
-        return True
 
     def run(self):
         metadata_file_path = None
@@ -90,8 +81,33 @@ class FileSenderJava(QThread):
         logger.debug("Sent halt signal")
         self.client_skt.send('encyp: h'.encode())
         self.client_skt.close()
+        self.transfer_finished.emit()
+
+    def get_temp_dir(self):
+        system = platform.system()
+        if system == "Windows":
+            temp_dir = Path(os.getenv('LOCALAPPDATA')) / 'Temp' / 'DataDash'
+        elif system == "Darwin":  # macOS
+            temp_dir = Path.home() / 'Library' / 'Caches' / 'DataDash'
+        elif system == "Linux":  # Linux and others
+            temp_dir = Path.home() / '.cache' / 'DataDash'
+        else:
+            logger.error(f"Unsupported platform: {system}")
+        
+        try:
+            os.makedirs(str(temp_dir), exist_ok=True)
+            logger.debug(f"Created/verified temp directory: {temp_dir}")
+        except Exception as e:
+            logger.error(f"Failed to create temp directory: {e}")
+            # Fallback to system temp directory
+            temp_dir = Path(tempfile.gettempdir()) / 'DataDash'
+            os.makedirs(str(temp_dir), exist_ok=True)
+            logger.debug(f"Using fallback temp directory: {temp_dir}")
+        
+        return temp_dir
 
     def create_metadata(self, folder_path=None,file_paths=None):
+        temp_dir = self.get_temp_dir()
         if folder_path:
             metadata = []
             for root, dirs, files in os.walk(folder_path):
@@ -112,7 +128,7 @@ class FileSenderJava(QThread):
                     })
             metadata.append({'base_folder_name': os.path.basename(folder_path), 'path': '.delete', 'size': 0})
             metadata_json = json.dumps(metadata)
-            metadata_file_path = os.path.join(folder_path, 'metadata.json')
+            metadata_file_path = os.path.join(temp_dir, 'metadata.json')
             with open(metadata_file_path, 'w') as f:
                 f.write(metadata_json)
             self.metadata_created = True
@@ -126,7 +142,7 @@ class FileSenderJava(QThread):
                     'size': file_size
                 })
             metadata_json = json.dumps(metadata)
-            metadata_file_path = os.path.join(os.path.dirname(file_paths[0]), 'metadata.json')
+            metadata_file_path = os.path.join(temp_dir, 'metadata.json')
             with open(metadata_file_path, 'w') as f:
                 f.write(metadata_json)
             self.metadata_created = True
@@ -345,7 +361,6 @@ class SendAppJava(QWidget):
          # Create 2 buttons for close and Transfer More Files
         # Keep them disabled until the file transfer is completed
         self.close_button = QPushButton('Close', self)
-        self.close_button.setEnabled(False)
         self.close_button.setVisible(False)
         self.close_button.clicked.connect(self.close)
         content_layout.addWidget(self.close_button)
@@ -431,7 +446,8 @@ class SendAppJava(QWidget):
         #com.an.Datadash
 
     def selectFile(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(self, 'Open Files')
+        documents= self.get_default_path()
+        file_paths, _ = QFileDialog.getOpenFileNames(self, 'Open Files', documents)
         if file_paths:
             self.file_path_display.clear()
             for file_path in file_paths:
@@ -440,13 +456,25 @@ class SendAppJava(QWidget):
             self.checkReadyToSend()
 
     def selectFolder(self):
-        folder_path = QFileDialog.getExistingDirectory(self, 'Select Folder')
+        documents= self.get_default_path()
+        folder_path = QFileDialog.getExistingDirectory(self, 'Select Folder', documents)
         if folder_path:
             self.file_path_display.clear()
             self.file_path_display.append(folder_path)
             self.file_paths = [folder_path]
             print(self.file_paths)
             self.checkReadyToSend()
+
+    def get_default_path(self):
+        if platform.system() == 'Windows':
+            return os.path.expanduser('~\\Documents')
+        elif platform.system() == 'Linux':
+            return os.path.expanduser('~/Documents')
+        elif platform.system() == 'Darwin':  # macOS
+            return os.path.expanduser('~/Documents')
+        else:
+            logger.error("Unsupported OS!")
+            return os.path.expanduser('~')  # Fallback to home directory
 
     def checkReadyToSend(self):
         if self.file_paths:
@@ -473,24 +501,27 @@ class SendAppJava(QWidget):
         self.progress_bar.setVisible(True)
         self.file_sender_java.progress_update.connect(self.updateProgressBar)
         self.file_sender_java.file_send_completed.connect(self.fileSent)
+        self.file_sender_java.transfer_finished.connect(self.onTransferFinished)
         self.file_sender_java.start()
         #com.an.Datadash
 
     def updateProgressBar(self, value):
         self.progress_bar.setValue(value)
-        if value >= 100:
-            self.status_label.setText("File transfer completed!")
-            self.status_label.setStyleSheet("color: white; font-size: 14px; background-color: transparent;")
-
+        # if value >= 100:
+            
             
             # Enable the close and Transfer More Files buttons
-            self.close_button.setEnabled(True)
-            self.close_button.setVisible(True)
             # self.mainmenu_button.setVisible(True)
 
 
     def fileSent(self, file_path):
         self.status_label.setText(f"File sent: {file_path}")
+
+    def onTransferFinished(self):
+        self.close_button.setVisible(True)
+        self.status_label.setText("File transfer completed!")
+        self.status_label.setStyleSheet("color: white; font-size: 14px; background-color: transparent;")
+
 
     def closeEvent(self, event):
         try:

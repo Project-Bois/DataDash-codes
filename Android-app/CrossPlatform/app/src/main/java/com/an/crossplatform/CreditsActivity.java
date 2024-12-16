@@ -6,6 +6,8 @@ import android.os.Bundle;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
+
+import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.an.crossplatform.R;
@@ -16,12 +18,19 @@ public class CreditsActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.credits); // Set your layout
 
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                closeBtn();
+            }
+        });
+
         // Set up links for each person
         setupLinkButtons();
 
         // Close button functionality
         Button closeButton = findViewById(R.id.close_button);
-        closeButton.setOnClickListener(v -> finish()); // Close activity
+        closeButton.setOnClickListener(v -> closeBtn());
     }
 
     private void setupLinkButtons() {
@@ -67,23 +76,14 @@ public class CreditsActivity extends AppCompatActivity {
         Button adwaitLinkedInButton = findViewById(R.id.adwait_linkedin_button);
         adwaitLinkedInButton.setOnClickListener(v -> openLink("https://www.linkedin.com/in/adwait-patil-56a1682a9/"));
 
-        // Samay's links
-        Button samayGitHubButton_doc = findViewById(R.id.samay_github_button_doc);
-        samayGitHubButton_doc.setOnClickListener(v -> openLink("https://github.com/ChampionSamay1644"));
-
-        Button samayLinkedInButton_doc = findViewById(R.id.samay_linkedin_button_doc);
-        samayLinkedInButton_doc.setOnClickListener(v -> openLink("https://www.linkedin.com/in/samaypandey1644"));
-        // Vedashree's links
-
-        Button vedashreeGitHubButton = findViewById(R.id.vedashree_github_button);
-        vedashreeGitHubButton.setOnClickListener(v -> openLink("https://github.com/vedashree2004"));
-
-        Button vedashreeLinkedInButton = findViewById(R.id.vedashree_linkedin_button);
-        vedashreeLinkedInButton.setOnClickListener(v -> openLink("https://www.linkedin.com/in/vedashree-gaikwad-716783298"));
     }
 
     private void openLink(String url) {
         Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
         startActivity(browserIntent);
+    }
+
+    private void closeBtn() {
+        finish();
     }
 }

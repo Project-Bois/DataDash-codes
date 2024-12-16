@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import QMessageBox, QWidget, QVBoxLayout, QLabel, QProgress
 from PyQt6.QtGui import QScreen,QMovie,QFont,QKeyEvent,QKeySequence
 from constant import get_config, logger
 from crypt_handler import decrypt_file, Decryptor
+import time
+import shutil
 
 SENDER_DATA = 57000
 RECEIVER_DATA = 58000
@@ -19,6 +21,7 @@ class ReceiveWorkerPython(QThread):
     decrypt_signal = pyqtSignal(list)
     close_connection_signal = pyqtSignal() 
     receiving_started = pyqtSignal()
+    transfer_finished = pyqtSignal()
     password = None
 
     def __init__(self, client_ip):
@@ -35,23 +38,45 @@ class ReceiveWorkerPython(QThread):
         #com.an.Datadash
 
     def initialize_connection(self):
-        # Close all previous server_sockets
-        if self.server_skt:
-            self.server_skt.close()
-        if self.client_skt:
-            self.client_skt.close()
-        self.server_skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+        """Initialize server socket with proper reuse settings"""
         try:
-            # Bind the server socket to a local port
+            # Close existing sockets
+            if self.server_skt:
+                try:
+                    self.server_skt.shutdown(socket.SHUT_RDWR)
+                    self.server_skt.close()
+                except:
+                    pass
+                
+            self.server_skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+            # Set socket options
+            self.server_skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if platform.system() != 'Windows':
+                try:
+                    self.server_skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except AttributeError:
+                    logger.debug("SO_REUSEPORT not available on this platform")
+            
+            # Configure timeout
+            self.server_skt.settimeout(60)
+            
+            # Bind and listen
             self.server_skt.bind(('', RECEIVER_DATA))
-            # Start listening for incoming connections
             self.server_skt.listen(1)
-            print("Waiting for a connection...")
+            logger.debug("Server initialized on port %d", RECEIVER_DATA)
+            
+        except OSError as e:
+            if e.errno == 48:  # Address already in use
+                logger.error("Port %d is in use, waiting to retry...", RECEIVER_DATA)
+                time.sleep(1)
+                self.initialize_connection()
+            else:
+                raise
         except Exception as e:
-            QMessageBox.critical(None, "Server Error", f"Failed to initialize the server: {str(e)}")
-            return None
+            logger.error("Failed to initialize server: %s", str(e))
+            raise
+
 
     def accept_connection(self):
         if self.client_skt:
@@ -61,7 +86,9 @@ class ReceiveWorkerPython(QThread):
             self.client_skt, self.client_address = self.server_skt.accept()
             print(f"Connected to {self.client_address}")
         except Exception as e:
-            QMessageBox.critical(None, "Connection Error", f"Failed to accept connection: {str(e)}")
+            error_message = f"Failed to accept connection: {str(e)}"
+            logger.error(error_message)
+            self.error_occurred.emit("Connection Error", error_message, "")
             return None
 
     def run(self):
@@ -102,6 +129,7 @@ class ReceiveWorkerPython(QThread):
                         self.decrypt_signal.emit(self.encrypted_files)
                     self.encrypted_files = []
                     logger.debug("Received halt signal. Stopping file reception.")
+                    self.transfer_finished.emit()
                     break
                 else:
                     encrypted_transfer = False
@@ -295,23 +323,48 @@ class ReceiveWorkerPython(QThread):
         return os.path.join(default_dir, file_name)
     
     def close_connection(self):
-        if self.client_skt:
-            self.client_skt.close()
-        if self.server_skt:
-            self.server_skt.close()
+        """Safely close all network connections"""
+        for sock in [self.client_skt, self.server_skt]:
+            if sock:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except:
+                    pass
+                finally:
+                    try:
+                        sock.close()
+                    except:
+                        pass
+        
+        self.client_skt = None
+        self.server_skt = None
+        logger.debug("All connections closed")
+
+    def stop(self):
+        """Stop all operations and cleanup resources"""
+        try:
+            self.broadcasting = False
+            self.close_connection()
+            self.quit()
+            self.wait(2000)  # Wait up to 2 seconds for thread to finish
+            if self.isRunning():
+                self.terminate()
+        except Exception as e:
+            logger.error(f"Error during worker stop: {e}")
 
 
 class ReceiveAppP(QWidget):
     progress_update = pyqtSignal(int)
 
-    def __init__(self, client_ip):
+    def __init__(self, client_ip, sender_os):
         super().__init__()
         self.client_ip = client_ip
+        self.sender_os = sender_os  # Store sender's OS
         self.initUI()
         self.setFixedSize(853, 480)
         #com.an.Datadash
         
-        self.current_text = "Waiting for file..."  # The full text for the label
+        self.current_text = self.displaytxt()  # The full text for the label
         self.displayed_text = ""  # Text that will appear with typewriter effect
         self.char_index = 0  # Keeps track of the character index for typewriter effect
         self.progress_bar.setVisible(False)  # Initially hidden
@@ -319,16 +372,17 @@ class ReceiveAppP(QWidget):
         self.file_receiver = ReceiveWorkerPython(client_ip)
         self.file_receiver.progress_update.connect(self.updateProgressBar)
         self.file_receiver.decrypt_signal.connect(self.decryptor_init)
-        self.file_receiver.receiving_started.connect(self.show_progress_bar)  # Connect new signal
+        self.file_receiver.receiving_started.connect(self.show_progress_bar)
+        self.file_receiver.transfer_finished.connect(self.onTransferFinished)
        
         
         # Start the typewriter effect
         self.typewriter_timer = QTimer(self)
         self.typewriter_timer.timeout.connect(self.update_typewriter_effect)
-        self.typewriter_timer.start(100)  # Adjust speed of typewriter effect
+        self.typewriter_timer.start(50)  # Adjust speed of typewriter effect
 
-        # Start the file receiving process and set progress bar visibility
-        QMetaObject.invokeMethod(self.file_receiver, "start", Qt.ConnectionType.QueuedConnection)
+        # Start the file receiving process directly on the main thread
+        self.file_receiver.start()
 
     def initUI(self):
         self.setWindowTitle('Receive File')
@@ -418,6 +472,26 @@ class ReceiveAppP(QWidget):
         if event.key() == Qt.Key.Key_Escape:
             self.openMainWindow()
 
+    def displaytxt(self):
+        if self.sender_os == 'Windows':
+            return 'Waiting to receive files from a Windows device'
+        elif self.sender_os == 'Linux':
+            return 'Waiting to receive files from a Linux device'
+        elif self.sender_os == 'Darwin':
+            return 'Waiting to receive files from a macOS device'
+        else:
+            return 'Waiting to receive files from Desktop app'
+        
+    def displaytxtreceive(self):
+        if self.sender_os == 'Windows':
+            return 'Receiving files from a Windows device'
+        elif self.sender_os == 'Linux':
+            return 'Receiving files from a Linux device'
+        elif self.sender_os == 'Darwin':
+            return 'Receiving files from a macOS device'
+        else:
+            return 'Receiving files from Desktop app'
+
     def openMainWindow(self):
         from main import MainApp
         self.main_window = MainApp()
@@ -470,6 +544,7 @@ class ReceiveAppP(QWidget):
 
     def show_progress_bar(self):
         self.progress_bar.setVisible(True)
+        self.label.setText(self.displaytxtreceive())
 
     
     def update_typewriter_effect(self):
@@ -485,12 +560,13 @@ class ReceiveAppP(QWidget):
 
     def updateProgressBar(self, value):
         self.progress_bar.setValue(value)
-        if value >= 100:
-            self.label.setText("File received successfully!")
-            self.open_dir_button.setVisible(True)  # Show the button when file is received
-            self.change_gif_to_success()  # Change GIF to success animation
-            self.close_button.setVisible(True)
-            # self.mainmenu_button.setVisible(True)
+
+    def onTransferFinished(self):
+        self.label.setText("File received successfully!")
+        self.open_dir_button.setVisible(True)  # Show the button when file is received
+        self.change_gif_to_success()  # Change GIF to success animation
+        self.close_button.setVisible(True)
+
 
     def change_gif_to_success(self):
         self.receiving_movie.stop()
@@ -505,9 +581,7 @@ class ReceiveAppP(QWidget):
             self.decryptor.show()
 
     def open_receiving_directory(self):
-
-        receiving_dir = get_config()["save_to_directory"]
-        #com.an.Datadash
+        receiving_dir = get_config().get("save_to_directory", "")
         
         if receiving_dir:
             try:
@@ -515,38 +589,63 @@ class ReceiveAppP(QWidget):
                 
                 if current_os == 'Windows':
                     os.startfile(receiving_dir)
+                
                 elif current_os == 'Linux':
                     subprocess.Popen(["xdg-open", receiving_dir])
+                
                 elif current_os == 'Darwin':  # macOS
                     subprocess.Popen(["open", receiving_dir])
+                
                 else:
                     raise NotImplementedError(f"Unsupported OS: {current_os}")
             
+            except FileNotFoundError as fnfe:
+                logger.error("No file manager or terminal emulator found on Linux: %s", fnfe)
             except Exception as e:
                 logger.error("Failed to open directory: %s", str(e))
+        else:
+            logger.error("No receiving directory configured.")
+
+
+    def show_error_message(self, title, message, detailed_text):
+        QMessageBox.critical(self, title, message)
 
     def closeEvent(self, event):
+        """Handle application close event"""
         try:
-            """Override the close event to ensure everything is stopped properly."""
-            self.stop()
+            # Stop the typewriter effect
+            if hasattr(self, 'typewriter_timer'):
+                self.typewriter_timer.stop()
+                
+            # Stop file receiver and cleanup
+            if hasattr(self, 'file_receiver'):
+                self.file_receiver.stop()
+                self.file_receiver.close_connection()
+                
+                # Ensure thread is properly terminated
+                if not self.file_receiver.wait(3000):  # Wait up to 3 seconds
+                    self.file_receiver.terminate()
+                    self.file_receiver.wait()
+                    
+            # Stop any running movies
+            if hasattr(self, 'receiving_movie'):
+                self.receiving_movie.stop()
+            if hasattr(self, 'success_movie'):
+                self.success_movie.stop()
+                
         except Exception as e:
-            pass
+            logger.error(f"Error during shutdown: {e}")
         finally:
             event.accept()
 
-    def stop(self):
-        """Sets the stop signal to True and closes the socket if it's open."""
-        self.stop_signal = True
-        if self.client_skt:
-            try:
-                self.client_skt.close()
-            except Exception as e:
-                logger.error(f"Error while closing socket: {e}")
-        if self.server_skt:
-            try:
-                self.server_skt.close()
-            except Exception as e:
-                logger.error(f"Error while closing socket: {e}")
+    def __del__(self):
+        """Ensure cleanup on object destruction"""
+        try:
+            if hasattr(self, 'file_receiver'):
+                self.file_receiver.stop()
+                self.file_receiver.close_connection()
+        except:
+            pass
 
 if __name__ == '__main__':
     import sys
