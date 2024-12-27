@@ -9,12 +9,17 @@ from PyQt6.QtWidgets import (
     QMessageBox, QListWidget, QListWidgetItem, QFrame
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QPointF, QTimer, QSize
-from PyQt6.QtGui import QScreen, QColor, QLinearGradient, QPainter, QPen, QFont, QIcon, QKeySequence,QKeyEvent
-from constant import BROADCAST_PORT, LISTEN_PORT, logger, get_config, RECEIVER_JSON
+from PyQt6.QtGui import QScreen, QColor, QLinearGradient, QPainter, QPen, QFont, QIcon, QKeySequence, QKeyEvent
+from loges import logger
+from constant import ConfigManager  # Updated import
+from portsss import BROADCAST_PORT, LISTEN_PORT, RECEIVER_JSON
 from file_sender import SendApp
 from file_sender_java import SendAppJava
 from file_sender_swift import SendAppSwift
-import netifaces
+import os
+import time
+
+BROADCAST_ADDRESS="255.255.255.255"
 
 class CircularDeviceButton(QWidget):
     def __init__(self, device_name, device_ip, parent=None):
@@ -88,118 +93,107 @@ class BroadcastWorker(QThread):
         self.socket = None
         self.client_socket = None
         self.receiver_data = None
+        self.config_manager = ConfigManager()
+        self.config_manager.start()
 
     def run(self):
-        # Start discovering receivers directly
-        self.discover_receivers()
-
-    def get_broadcast(self):
-        try:
-            # Get all network interfaces
-            for interface in netifaces.interfaces():
-                # Skip loopback interface
-                if interface.startswith('lo'):
-                    continue
-                    
-                addrs = netifaces.ifaddresses(interface)
-                
-                # Check for IPv4 addresses
-                if netifaces.AF_INET in addrs:
-                    for addr in addrs[netifaces.AF_INET]:
-                        ip = addr['addr']
-                        # Skip loopback addresses
-                        if not ip.startswith('127.'):
-                            logger.info("Local IP determined: %s", ip)
-                            # Split IP and create broadcast
-                            ip_parts = ip.split('.')
-                            ip_parts[-1] = '255'
-                            broadcast_address = '.'.join(ip_parts)
-                            logger.info("Broadcast address determined: %s", broadcast_address)
-                            return broadcast_address
-
-            logger.error("No valid network interface found")
-            return "Unable to get IP"
-                            
-        except Exception as e:
-            logger.error("Error obtaining local IP: %s", e)
-            return "Unable to get IP"
-
-    def discover_receivers(self):
-        broadcast_address = self.get_broadcast()
-        if broadcast_address == "Unable to get IP":
-            return
-            
-        # Create new UDP socket
+        logger.info("Starting receiver discovery process")
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            
-            # Bind to LISTEN_PORT to receive responses
-            s.bind(('', LISTEN_PORT))
-            logger.info("Sending discover packet to %s:%d", broadcast_address, BROADCAST_PORT)
-            
-            # Send discovery packet
-            s.sendto(b'DISCOVER', (broadcast_address, BROADCAST_PORT))
-            
-            # Listen for responses with timeout
-            s.settimeout(2)
             try:
-                while True:
-                    message, address = s.recvfrom(1024)
-                    message = message.decode()
-                    logger.info("Received response from %s: %s", address[0], message)
-                    
-                    if message.startswith('RECEIVER:'):
-                        device_name = message.split(':')[1]
-                        device_info = {'ip': address[0], 'name': device_name}
-                        logger.info("Found device: %s", device_info)
-                        self.device_detected.emit(device_info)
+                logger.debug("Setting socket options")
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                
+                logger.debug(f"Binding to LISTEN_PORT {LISTEN_PORT}")
+                s.bind(('', LISTEN_PORT))
+                logger.info("Sending discover packet to 255.255.255.255:49185")
+                
+                s.settimeout(2.0)
+                start_time = time.time()
+                timeout_duration = 2.0
+
+                logger.debug("Sending DISCOVER broadcast")
+                s.sendto(b'DISCOVER', ('255.255.255.255', BROADCAST_PORT))
+                
+                while (time.time() - start_time) < timeout_duration:
+                    try:
+                        logger.debug("Waiting for discovery responses...")
+                        message, address = s.recvfrom(1024)
+                        message = message.decode()
+                        logger.info(f"Received response from {address[0]}: {message}")
                         
-            except socket.timeout:
-                logger.info("Discovery timeout reached")
+                        if message.startswith('RECEIVER:'):
+                            device_name = message.split(':')[1]
+                            device_info = {'ip': address[0], 'name': device_name}
+                            logger.info(f"Found valid device: {device_info}")
+                            self.device_detected.emit(device_info)
+                            
+                    except socket.timeout:
+                        logger.debug("Socket timeout while waiting for response")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing discovery response: {str(e)}")
+                        break
+                
+                logger.info(f"Discovery completed after {time.time() - start_time:.2f} seconds")
+            
             except Exception as e:
-                logger.error("Error during discovery: %s", str(e))
+                logger.error(f"Critical error during discovery process: {str(e)}")
 
     def connect_to_device(self, device_ip, device_name):
+        logger.info(f"Initiating connection to device {device_name} ({device_ip})")
         try:
             if self.client_socket:
-                self.client_socket.shutdown(socket.SHUT_RDWR)  # Properly shutdown before closing
+                logger.debug("Closing existing socket connection")
+                self.client_socket.shutdown(socket.SHUT_RDWR)
                 self.client_socket.close()
             
-            # Create a new socket for connection
+            logger.debug("Creating new TCP socket")
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            logger.info(f"Attempting to connect to {device_ip}:{RECEIVER_JSON}")
             self.client_socket.connect((device_ip, RECEIVER_JSON))
 
             device_data = {
                 'device_type': 'python',
                 'os': platform.system()
             }
+            logger.debug(f"Sending device data: {device_data}")
             device_data_json = json.dumps(device_data)
             self.client_socket.send(struct.pack('<Q', len(device_data_json)))
             self.client_socket.send(device_data_json.encode())
-            #com.an.Datadash
 
+            logger.debug("Waiting for receiver data")
             receiver_json_size = struct.unpack('<Q', self.client_socket.recv(8))[0]
             receiver_json = self.client_socket.recv(receiver_json_size).decode()
             self.receiver_data = json.loads(receiver_json)
+            logger.info(f"Received device data: {self.receiver_data}")
 
             device_type = self.receiver_data.get('device_type', 'unknown')
+            logger.info(f"Detected device type: {device_type}")
+
             if device_type == 'python':
+                logger.info("Connecting to Python device")
                 self.device_connected.emit(device_ip, device_name, self.receiver_data)
                 self.client_socket.close()
             elif device_type == 'java':
+                logger.info("Connecting to Java device")
                 self.device_connected_java.emit(device_ip, device_name, self.receiver_data)
             elif device_type == 'swift':
+                logger.info("Connecting to Swift device")
                 self.device_connected_swift.emit(device_ip, device_name, self.receiver_data)
             else:
+                logger.error(f"Unsupported device type: {device_type}")
                 raise ValueError("Unsupported device type")
 
         except Exception as e:
+            logger.error(f"Connection error: {str(e)}")
             QMessageBox.critical(None, "Connection Error", f"Failed to connect: {str(e)}")
         finally:
             if self.client_socket:
-                self.client_socket.close()  # Ensure the socket is always closed
+                logger.debug("Closing socket connection")
+                self.client_socket.close()
 
     def closeEvent(self, event):
         # Ensure socket is forcefully closed
@@ -229,6 +223,10 @@ class Broadcast(QWidget):
    
     def __init__(self):
         super().__init__()
+        self.config_manager = ConfigManager()
+        self.config_manager.config_updated.connect(self.on_config_updated)
+        self.config_manager.log_message.connect(logger.info)
+        self.config_manager.start()
         self.setWindowTitle('Device Discovery')
         self.setFixedSize(853, 480)  # Updated to 1280x720 (16:9 ratio)
         self.center_window()
@@ -454,68 +452,17 @@ class Broadcast(QWidget):
         self.send_app.show()
 
     def show_send_app_java(self, device_ip, device_name, receiver_data):
-        
-        if get_config()["encryption"] and get_config()["show_warning"]:
-                msg_box = QMessageBox(self)
-                msg_box.setWindowTitle("Input Error")
-                msg_box.setText("You have encryption Enabled, unfortunately android tranfer doesn't support that yet. Clicking ok will bypass your encryption settings for this file transfer.")
-                msg_box.setIcon(QMessageBox.Icon.Critical)
-                msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-
-                # Apply custom style with gradient background
-                msg_box.setStyleSheet("""
-                    QMessageBox {
-                        background: qlineargradient(
-                            x1: 0, y1: 0, x2: 1, y2: 1,
-                            stop: 0 #b0b0b0,
-                            stop: 1 #505050
-                        );
-                        color: #FFFFFF;
-                        font-size: 16px;
-                    }
-                    QLabel {
-                    background-color: transparent; /* Make the label background transparent */
-                    }
-                    QPushButton {
-                        background: qlineargradient(
-                            x1: 0, y1: 0, x2: 1, y2: 0,
-                            stop: 0 rgba(47, 54, 66, 255),
-                            stop: 1 rgba(75, 85, 98, 255)
-                        );
-                        color: white;
-                        border-radius: 10px;
-                        border: 1px solid rgba(0, 0, 0, 0.5);
-                        padding: 4px;
-                        font-size: 16px;
-                    }
-                    QPushButton:hover {
-                        background: qlineargradient(
-                            x1: 0, y1: 0, x2: 1, y2: 0,
-                            stop: 0 rgba(60, 68, 80, 255),
-                            stop: 1 rgba(90, 100, 118, 255)
-                        );
-                    }
-                    QPushButton:pressed {
-                        background: qlineargradient(
-                            x1: 0, y1: 0, x2: 1, y2: 0,
-                            stop: 0 rgba(35, 41, 51, 255),
-                            stop: 1 rgba(65, 75, 88, 255)
-                        );
-                    }
-                """)
-                msg_box.exec() 
-        
         self.hide()
         self.send_app_java = SendAppJava(device_ip, device_name, receiver_data)
         self.send_app_java.show()
         #com.an.Datadash
 
     def show_send_app_swift(self, device_ip, device_name, receiver_data):
-        
-        if get_config()["encryption"] and get_config()["show_warning"]:
+        config = self.config_manager.get_config()
+        if config["encryption"] and config["show_warning"]:
                 msg_box = QMessageBox(self)
                 msg_box.setWindowTitle("Input Error")
-                msg_box.setText("You have encryption Enabled, unfortunately android tranfer doesn't support that yet. Clicking ok will bypass your encryption settings for this file transfer.")
+                msg_box.setText("You have encryption Enabled, unfortunately IOS/IpadOS tranfer doesn't support that yet. Clicking ok will bypass your encryption settings for this file transfer.")
                 msg_box.setIcon(QMessageBox.Icon.Critical)
                 msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
 
@@ -592,6 +539,10 @@ class Broadcast(QWidget):
                 print("Socket closed manually.")
             except Exception as e:
                 print(f"Error stopping socket: {str(e)}")
+
+    def on_config_updated(self, config):
+        """Handler for config updates"""
+        self.current_config = config
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

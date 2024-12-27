@@ -2,18 +2,18 @@ import os
 import socket
 import struct
 import json
+from loges import logger
 from PyQt6 import QtCore
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMetaObject,QTimer
 from PyQt6.QtWidgets import QMessageBox, QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication,QPushButton,QHBoxLayout
 from PyQt6.QtGui import QScreen,QMovie,QFont,QKeySequence,QKeyEvent
-from constant import get_config, logger
+from constant import ConfigManager
 from crypt_handler import decrypt_file, Decryptor
 import subprocess
 import platform
 import time
 import shutil
-
-RECEIVER_DATA = 57341
+from portsss import RECEIVER_DATA_ANDROID, CHUNK_SIZE_ANDROID
 
 class ReceiveWorkerJava(QThread):
     progress_update = pyqtSignal(int)
@@ -32,6 +32,8 @@ class ReceiveWorkerJava(QThread):
         self.destination_folder = None
         self.store_client_ip = client_ip
         self.base_folder_name = ''
+        self.config_manager = ConfigManager()
+        self.config_manager.start()
         logger.debug(f"Client IP address stored: {self.store_client_ip}")
 
     def initialize_connection(self):
@@ -59,13 +61,13 @@ class ReceiveWorkerJava(QThread):
             self.server_skt.settimeout(60)
             
             # Bind and listen
-            self.server_skt.bind(('', RECEIVER_DATA))
+            self.server_skt.bind(('', RECEIVER_DATA_ANDROID))
             self.server_skt.listen(1)
-            logger.debug("Server initialized on port %d", RECEIVER_DATA)
+            logger.debug("Server initialized on port %d", RECEIVER_DATA_ANDROID)
             
         except OSError as e:
             if e.errno == 48:  # Address already in use
-                logger.error("Port %d is in use, waiting to retry...", RECEIVER_DATA)
+                logger.error("Port %d is in use, waiting to retry...", RECEIVER_DATA_ANDROID)
                 time.sleep(1)
                 self.initialize_connection()
             else:
@@ -163,7 +165,7 @@ class ReceiveWorkerJava(QThread):
                             self.destination_folder = self.create_folder_structure(self.metadata)
                         else:
                             # For single files, use default directory
-                            self.destination_folder = get_config()["save_to_directory"]
+                            self.destination_folder = self.config_manager.get_config()["save_to_directory"]
                         continue
 
                     # Determine file path based on transfer type
@@ -187,7 +189,7 @@ class ReceiveWorkerJava(QThread):
                         received_size = 0
                         remaining = file_size
                         while remaining > 0:
-                            chunk_size = min(4096, remaining)
+                            chunk_size = min(CHUNK_SIZE_ANDROID, remaining)
                             data = self.client_skt.recv(chunk_size)
                             if not data:
                                 raise ConnectionError("Connection lost during file reception.")
@@ -235,7 +237,7 @@ class ReceiveWorkerJava(QThread):
 
     def create_folder_structure(self, metadata):
         """Create folder structure based on metadata."""
-        default_dir = get_config()["save_to_directory"]
+        default_dir = self.config_manager.get_config()["save_to_directory"]
         
         if not default_dir:
             raise ValueError("No save_to_directory configured")
@@ -302,7 +304,8 @@ class ReceiveWorkerJava(QThread):
 
     def get_file_path(self, file_name):
         """Get the file path for saving the received file."""
-        default_dir = get_config()["save_to_directory"]
+        config = self.config_manager.get_config()
+        default_dir = config.get("save_to_directory")
         if not default_dir:
             raise NotImplementedError("Unsupported OS")
         return os.path.join(default_dir, file_name)
@@ -363,6 +366,7 @@ class ReceiveAppPJava(QWidget):
         self.typewriter_timer.start(50)
 
         QMetaObject.invokeMethod(self.file_receiver, "start", Qt.ConnectionType.QueuedConnection)
+        self.config_manager = ConfigManager()
 
     def initUI(self):
         self.setWindowTitle('Receive File')
@@ -531,26 +535,83 @@ class ReceiveAppPJava(QWidget):
             self.decryptor.show()
 
     def open_receiving_directory(self):
-        receiving_dir = get_config().get("save_to_directory", "")
-        
+        config = self.file_receiver.config_manager.get_config()
+        receiving_dir = config.get("save_to_directory", "")
+
         if receiving_dir:
             try:
                 current_os = platform.system()
-                
+
                 if current_os == 'Windows':
                     os.startfile(receiving_dir)
-                
+
                 elif current_os == 'Linux':
-                    subprocess.Popen(["xdg-open", receiving_dir])
-                
+                    file_managers = [
+                        ["xdg-open", receiving_dir],
+                        ["xdg-mime", "open", receiving_dir],
+                        ["dbus-send", "--print-reply", "--dest=org.freedesktop.FileManager1",
+                         "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowFolders",
+                         "array:string:" + receiving_dir, "string:"],
+                        ["gio", "open", receiving_dir],
+                        ["gvfs-open", receiving_dir],
+                        ["kde-open", receiving_dir],
+                        ["kfmclient", "exec", receiving_dir],
+                        ["nautilus", receiving_dir],
+                        ["dolphin", receiving_dir],
+                        ["thunar", receiving_dir],
+                        ["pcmanfm", receiving_dir],
+                        ["krusader", receiving_dir],
+                        ["mc", receiving_dir],
+                        ["nemo", receiving_dir],
+                        ["caja", receiving_dir],
+                        ["konqueror", receiving_dir],
+                        ["gwenview", receiving_dir],
+                        ["gimp", receiving_dir],
+                        ["eog", receiving_dir],
+                        ["feh", receiving_dir],
+                        ["gpicview", receiving_dir],
+                        ["mirage", receiving_dir],
+                        ["ristretto", receiving_dir],
+                        ["viewnior", receiving_dir],
+                        ["gthumb", receiving_dir],
+                        ["nomacs", receiving_dir],
+                        ["geeqie", receiving_dir],
+                        ["gwenview", receiving_dir],
+                        ["gpicview", receiving_dir],
+                        ["mirage", receiving_dir],
+                        ["ristretto", receiving_dir],
+                        ["viewnior", receiving_dir],
+                        ["gthumb", receiving_dir],
+                        ["nomacs", receiving_dir],
+                        ["geeqie", receiving_dir],
+                    ]
+
+                    success = False
+                    for cmd in file_managers:
+                        try:
+                            subprocess.run(cmd, timeout=3, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+                            logger.info(f"Successfully opened directory with {cmd[0]}")
+                            success = True
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                        except FileNotFoundError:
+                            continue
+                        except Exception as e:
+                            logger.debug(f"Failed to open with {cmd[0]}: {str(e)}")
+                            continue
+
+                    if not success:
+                        raise Exception("No suitable file manager found")
+
                 elif current_os == 'Darwin':  # macOS
                     subprocess.Popen(["open", receiving_dir])
-                
+
                 else:
                     raise NotImplementedError(f"Unsupported OS: {current_os}")
-            
+
             except FileNotFoundError as fnfe:
-                logger.error("No file manager or terminal emulator found on Linux: %s", fnfe)
+                logger.error("No file manager found: %s", fnfe)
             except Exception as e:
                 logger.error("Failed to open directory: %s", str(e))
         else:
@@ -596,6 +657,9 @@ class ReceiveAppPJava(QWidget):
     def __del__(self):
         """Ensure cleanup on object destruction"""
         try:
+            if hasattr(self, 'config_manager'):
+                self.config_manager.quit()
+                self.config_manager.wait()
             if hasattr(self, 'file_receiver'):
                 self.file_receiver.stop()
                 self.file_receiver.close_connection()

@@ -12,27 +12,40 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt
 import os
 import socket
 import struct
-from constant import get_config, logger
+from constant import ConfigManager  # Updated import
+from loges import logger
 from crypt_handler import encrypt_file
 from time import sleep
-
-SENDER_DATA = 57000
-RECEIVER_DATA = 58000
+from portsss import RECEIVER_DATA_DESKTOP, CHUNK_SIZE_DESKTOP
 
 class FileSender(QThread):
     progress_update = pyqtSignal(int)
     file_send_completed = pyqtSignal(str)
     transfer_finished = pyqtSignal()
+    file_count_update = pyqtSignal(int, int, int)  # total_files, files_sent, files_pending
 
     password = None
 
     def __init__(self, ip_address, file_paths, password=None, receiver_data=None):
         super().__init__()
+        self.config_manager = ConfigManager()
+        self.config_manager.start()
         self.ip_address = ip_address
         self.file_paths = file_paths
         self.password = password
         self.receiver_data = receiver_data
+        self.total_files = self.count_total_files()
+        self.files_sent = 0
 
+    def count_total_files(self):
+        total = 0
+        for path in self.file_paths:
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    total += len(files)
+            else:
+                total += 1
+        return total
 
     def initialize_connection(self):
         # Ensure previous socket is closed before re-binding
@@ -53,8 +66,8 @@ class FileSender(QThread):
         try:
             self.client_skt.bind(('', 0))  # Bind to any available port assigned by the OS
             logger.debug(f"Bound to port {self.client_skt.getsockname()[1]}")  # Log the assigned port for debugging
-            self.client_skt.connect((self.ip_address, RECEIVER_DATA))  # Connect to receiver's IP and port
-            logger.debug(f"Successfully connected to {self.ip_address} on port {RECEIVER_DATA}")
+            self.client_skt.connect((self.ip_address, RECEIVER_DATA_DESKTOP))  # Connect to receiver's IP and port
+            logger.debug(f"Successfully connected to {self.ip_address} on port {RECEIVER_DATA_DESKTOP}")
         except ConnectionRefusedError:
             logger.error("Connection refused: Failed to connect to the specified IP address.")
             self.show_message_box("Connection Error", "Failed to connect to the specified IP address.")
@@ -80,7 +93,7 @@ class FileSender(QThread):
         if not self.initialize_connection():
             return
         
-        self.encryption_flag = get_config()["encryption"]
+        self.encryption_flag = self.config_manager.get_config()["encryption"]
 
         for file_path in self.file_paths:
             if os.path.isdir(file_path):
@@ -88,7 +101,7 @@ class FileSender(QThread):
             else:
                 if not self.metadata_created:
                     metadata_file_path = self.create_metadata(file_paths=self.file_paths)
-                    self.send_file(metadata_file_path)
+                    self.send_file(metadata_file_path, count=False)
                 self.send_file(file_path, encrypted_transfer=self.encryption_flag)
         
         if self.metadata_created and metadata_file_path:
@@ -172,7 +185,7 @@ class FileSender(QThread):
         if not self.metadata_created:
             metadata_file_path = self.create_metadata(folder_path=folder_path)
             metadata = json.loads(open(metadata_file_path).read())
-            self.send_file(metadata_file_path)
+            self.send_file(metadata_file_path, count=False)
 
         for file_info in metadata:
             relative_file_path = file_info['path']
@@ -185,7 +198,7 @@ class FileSender(QThread):
 
         os.remove(metadata_file_path)
 
-    def send_file(self, file_path, relative_file_path=None, encrypted_transfer=False):
+    def send_file(self, file_path, relative_file_path=None, encrypted_transfer=False, count=True):
         logger.debug("Sending file: %s", file_path)
 
         if encrypted_transfer:
@@ -211,10 +224,15 @@ class FileSender(QThread):
 
         with open(file_path, 'rb') as f:
             while sent_size < file_size:
-                data = f.read(4096)
+                data = f.read(CHUNK_SIZE_DESKTOP)
                 self.client_skt.sendall(data)
                 sent_size += len(data)
                 self.progress_update.emit(sent_size * 100 // file_size)
+
+        if count:
+            self.files_sent += 1
+            files_pending = self.total_files - self.files_sent
+            self.file_count_update.emit(self.total_files, self.files_sent, files_pending)
 
         if encrypted_transfer:
             os.remove(file_path)
@@ -239,6 +257,10 @@ class SendApp(QWidget):
 
     def __init__(self, ip_address, device_name, receiver_data):
         super().__init__()
+        self.config_manager = ConfigManager()
+        self.config_manager.config_updated.connect(self.on_config_updated)
+        self.config_manager.log_message.connect(logger.info)
+        self.config_manager.start()
         self.ip_address = ip_address
         self.device_name = device_name
         self.receiver_data = receiver_data
@@ -246,9 +268,12 @@ class SendApp(QWidget):
         self.initUI()
         self.progress_bar.setVisible(False)
 
+    def on_config_updated(self, config):
+        self.current_config = config
+
     def initUI(self):
  
-        logger.debug("Encryption : %s", get_config()["encryption"])
+        logger.debug("Encryption : %s", self.config_manager.get_config()["encryption"])
         self.setWindowTitle('DataDash: Send File')
         self.setFixedSize(853, 480)   # Updated to 16:9 ratio
         self.center_window()
@@ -304,7 +329,7 @@ class SendApp(QWidget):
         content_layout.addWidget(self.file_path_display)
 
         # Password input (if encryption is enabled)
-        if get_config()["encryption"]:
+        if self.config_manager.get_config()["encryption"]:
             password_layout = QHBoxLayout()
             self.password_label = QLabel('Encryption Password:')
             self.password_label.setStyleSheet("color: white; font-size: 14px; background-color: transparent;")
@@ -350,6 +375,11 @@ class SendApp(QWidget):
         self.status_label = QLabel("")
         self.style_label(self.status_label)
         content_layout.addWidget(self.status_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # Add label for file counts
+        self.file_counts_label = QLabel("Total files: 0 | Completed: 0 | Pending: 0")
+        self.file_counts_label.setStyleSheet("color: white; font-size: 14px; background-color: transparent;")
+        content_layout.addWidget(self.file_counts_label)
 
         # Keep them disabled until the file transfer is completed
         self.close_button = self.create_styled_button_close('Close')  # Apply styling here
@@ -514,7 +544,7 @@ class SendApp(QWidget):
     def sendSelectedFiles(self):
         password = None
 
-        if get_config()["encryption"]:
+        if self.config_manager.get_config()["encryption"]:
             password = self.password_input.text()
             if not password:
                 msg_box = QMessageBox(self)
@@ -575,6 +605,7 @@ class SendApp(QWidget):
         self.file_sender.progress_update.connect(self.updateProgressBar)
         self.file_sender.file_send_completed.connect(self.fileSent)
         self.file_sender.transfer_finished.connect(self.onTransferFinished)
+        self.file_sender.file_count_update.connect(self.updateFileCounts)
         self.file_sender.start()
         #com.an.Datadash
 
@@ -583,6 +614,9 @@ class SendApp(QWidget):
 
     def fileSent(self, file_path):
         self.status_label.setText(f"File sent: {file_path}")
+
+    def updateFileCounts(self, total_files, files_sent, files_pending):
+        self.file_counts_label.setText(f"Total files: {total_files} | Completed: {files_sent} | Pending: {files_pending}")
 
     def onTransferFinished(self):
         self.close_button.setVisible(True)
@@ -616,4 +650,5 @@ if __name__ == '__main__':
     send_app = SendApp("127.0.0.1", "Test Device", None)
     send_app.show()
     sys.exit(app.exec())
+    #com.an.Datadash
     #com.an.Datadash

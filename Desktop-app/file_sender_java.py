@@ -11,21 +11,22 @@ import os
 import socket
 import struct
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
-from constant import get_config, logger
+from constant import ConfigManager
+from loges import logger
 from crypt_handler import encrypt_file
 from time import sleep
-
-RECEIVER_DATA = 57341
+from portsss import RECEIVER_DATA_ANDROID,CHUNK_SIZE_ANDROID
 
 class FileSenderJava(QThread):
     progress_update = pyqtSignal(int)
     file_send_completed = pyqtSignal(str)
     transfer_finished = pyqtSignal()
-    config = get_config()
     password = None
 
     def __init__(self, ip_address, file_paths, password=None, receiver_data=None):
         super().__init__()
+        self.config_manager = ConfigManager()
+        self.config_manager.start()
         self.ip_address = ip_address
         self.file_paths = file_paths
         self.password = password
@@ -43,7 +44,7 @@ class FileSenderJava(QThread):
             self.client_skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.client_skt.settimeout(30)  # 30 second timeout
             
-            self.client_skt.connect((self.ip_address, 57341))
+            self.client_skt.connect((self.ip_address, RECEIVER_DATA_ANDROID))
             logger.debug(f"Successfully connected to {self.ip_address} on port 57341")
             return True
             
@@ -55,33 +56,36 @@ class FileSenderJava(QThread):
     def run(self):
         metadata_file_path = None
         self.metadata_created = False
-        metadata_file_path = None
         if not self.initialize_connection():
             return
         
         # Reload config on each file transfer session
-        self.config = get_config()
+        self.config = self.config_manager.get_config()
+        self.encryption_flag = self.config_manager.get_config()["encryption"]
 
-        self.encryption_flag = self.config['android_encryption']
-        # logger.debug("Encryption flag: %s", self.encryption_flag)
-
-        for file_path in self.file_paths:
-            if os.path.isdir(file_path):
-                self.send_folder(file_path)
-            else:
-                if not self.metadata_created:
-                    metadata_file_path = self.create_metadata(file_paths=self.file_paths)
-                    self.send_file(metadata_file_path)
-                self.send_file(file_path, encrypted_transfer=self.encryption_flag)
-        
-        # Delete metadata file
-        if self.metadata_created and metadata_file_path:
-            os.remove(metadata_file_path)
+        try:
+            for file_path in self.file_paths:
+                if os.path.isdir(file_path):
+                    if not self.metadata_created:
+                        metadata_file_path = self.create_metadata(folder_path=file_path)
+                        self.send_file(metadata_file_path, encrypted_transfer=False)
+                        self.metadata_created = True
+                    self.send_folder(file_path)
+                else:
+                    if not self.metadata_created:
+                        metadata_file_path = self.create_metadata(file_paths=self.file_paths)
+                        self.send_file(metadata_file_path, encrypted_transfer=False)
+                        self.metadata_created = True
+                    self.send_file(file_path, encrypted_transfer=self.encryption_flag)
             
-        logger.debug("Sent halt signal")
-        self.client_skt.send('encyp: h'.encode())
-        self.client_skt.close()
-        self.transfer_finished.emit()
+            # Send halt signal after all transfers complete
+            logger.debug("Sent halt signal")
+            self.client_skt.send('encyp: h'.encode())
+            self.transfer_finished.emit()
+        finally:
+            if self.metadata_created and metadata_file_path:
+                os.remove(metadata_file_path)
+            self.client_skt.close()
 
     def get_temp_dir(self):
         system = platform.system()
@@ -113,7 +117,7 @@ class FileSenderJava(QThread):
             for root, dirs, files in os.walk(folder_path):
                 for file in files:
                     file_path = os.path.join(root, file)
-                    relative_path = os.path.relpath(file_path, folder_path)
+                    relative_path = os.path.relpath(file_path, folder_path).replace('\\', '/')
                     file_size = os.path.getsize(file_path)
                     metadata.append({
                         'path': relative_path,
@@ -121,7 +125,7 @@ class FileSenderJava(QThread):
                     })
                 for dir in dirs:
                     dir_path = os.path.join(root, dir)
-                    relative_path = os.path.relpath(dir_path, folder_path)
+                    relative_path = os.path.relpath(dir_path, folder_path).replace('\\', '/')
                     metadata.append({
                         'path': relative_path + '/',
                         'size': 0  # Size is 0 for directories
@@ -149,70 +153,65 @@ class FileSenderJava(QThread):
             return metadata_file_path
             
     def send_folder(self, folder_path):
-        print("Sending folder")
-        
-        if not self.metadata_created:
-            metadata_file_path = self.create_metadata(folder_path=folder_path)
-            metadata = json.loads(open(metadata_file_path).read())
-            # Send metadata file
-            self.send_file(metadata_file_path)
-            #com.an.Datadash
+        logger.debug("Sending folder: %s", folder_path)
 
-        # Send all files
-        for file_info in metadata:
-            relative_file_path = file_info['path']
-            file_path = os.path.join(folder_path, relative_file_path)
-            if not relative_file_path.endswith('.delete'):
-                if file_info['size'] > 0:
-                    if self.encryption_flag:
-                        relative_file_path += ".crypt"
-                    self.send_file(file_path, relative_file_path=relative_file_path, encrypted_transfer=self.encryption_flag)
-                else:
-                    # Handle directory creation (if needed, in receiver)
-                    pass
-
-        # Clean up metadata file
-        os.remove(metadata_file_path)
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                relative_path = os.path.relpath(file_path, folder_path)
+                
+                if self.encryption_flag:
+                    relative_path += ".crypt"
+                
+                self.send_file(file_path, relative_file_path=relative_path, encrypted_transfer=self.encryption_flag)
 
     def send_file(self, file_path, relative_file_path=None, encrypted_transfer=False):
         logger.debug("Sending file: %s", file_path)
-        # if self.metadata_created:
-        #     self.createmetadata(file_path=file_path)
 
-        # Encrypt the file if encrypted_transfer argument is present
+        # Handle file encryption if needed
         if encrypted_transfer:
             logger.debug("Encrypted transfer with password: %s", self.password)
-
             file_path = encrypt_file(file_path, self.password)
 
-        sent_size = 0
-        file_size = os.path.getsize(file_path)
-        if relative_file_path is None:
-            relative_file_path = os.path.basename(file_path)  # Default to the base name if relative path isn't provided
-        file_name_size = len(relative_file_path.encode())
-        logger.debug("Sending %s, %s", relative_file_path, file_size)
+        try:
+            file_size = os.path.getsize(file_path)
+            if relative_file_path is None:
+                relative_file_path = os.path.basename(file_path)
+            
+            # Send encryption flag
+            encryption_flag = 'encyp: t' if encrypted_transfer else 'encyp: f'
+            self.client_skt.send(encryption_flag.encode())
+            logger.debug("Sent encryption flag: %s", encryption_flag)
 
-        encryption_flag = 'encyp: t' if encrypted_transfer else 'encyp: f'
+            # Send file name size and name
+            file_name_bytes = relative_file_path.encode('utf-8')
+            self.client_skt.send(struct.pack('<Q', len(file_name_bytes)))
+            self.client_skt.send(file_name_bytes)
 
-        self.client_skt.send(encryption_flag.encode())
-        logger.debug("Sent encryption flag: %s", encryption_flag)
+            # Send file size
+            self.client_skt.send(struct.pack('<Q', file_size))
 
-        # Send the relative file path size and the path
-        self.client_skt.send(struct.pack('<Q', file_name_size))
-        self.client_skt.send(relative_file_path.encode('utf-8'))
-        self.client_skt.send(struct.pack('<Q', file_size))
+            # Send file data with progress updates
+            sent_size = 0
+            with open(file_path, 'rb') as f:
+                while sent_size < file_size:
+                    chunk = f.read(CHUNK_SIZE_ANDROID)
+                    if not chunk:
+                        break
+                    self.client_skt.sendall(chunk)
+                    sent_size += len(chunk)
+                    progress = int(sent_size * 100 / file_size)
+                    self.progress_update.emit(progress)
 
-        with open(file_path, 'rb') as f:
-            while sent_size < file_size:
-                data = f.read(4096)
-                self.client_skt.sendall(data)
-                sent_size += len(data)
-                self.progress_update.emit(sent_size * 100 // file_size)
+            # Clean up encrypted file if it was created
+            if encrypted_transfer:
+                os.remove(file_path)
 
-        if encrypted_transfer:
-            os.remove(file_path)
+            return True
 
-        return True
+        except Exception as e:
+            logger.error("Error sending file: %s", str(e))
+            return False
 
 class Receiver(QListWidgetItem):
     def __init__(self, name, ip_address):
@@ -242,20 +241,24 @@ class Receiver(QListWidgetItem):
         self.setText(f"{self._name} ({self._ip_address})")
 
 class SendAppJava(QWidget):
-    config = get_config()
-
     def __init__(self,ip_address,device_name,receiver_data):
+        super().__init__()
+        self.config_manager = ConfigManager()
+        self.config_manager.config_updated.connect(self.on_config_updated)
+        self.config_manager.log_message.connect(logger.info)
+        self.config_manager.start()
         self.ip_address = ip_address
         self.device_name = device_name
         self.receiver_data = receiver_data
-        super().__init__()
         self.initUI()
         self.progress_bar.setVisible(False)
         self.setFixedSize(853, 480) 
 
+    def on_config_updated(self, config):
+        self.current_config = config
+
     def initUI(self):
-        self.config = get_config()
-        logger.debug("Encryption : %s", self.config['android_encryption'])
+        logger.debug("Encryption : %s", self.config_manager.get_config()["encryption"])
         self.setWindowTitle('Send File')
         self.setGeometry(100, 100, 400, 300)
         self.center_window()
@@ -310,10 +313,10 @@ class SendAppJava(QWidget):
         content_layout.addWidget(self.file_path_display)
 
         # Password input (if encryption is enabled)
-        if self.config['android_encryption']:
+        if self.config_manager.get_config()['encryption']:
             password_layout = QHBoxLayout()
             self.password_label = QLabel('Encryption Password:')
-            self.password_label.setStyleSheet("color: white; font-size: 14px;")
+            self.password_label.setStyleSheet("color: white; font-size: 14px; background-color: transparent;")
             password_layout.addWidget(self.password_label)
 
             self.password_input = QLineEdit()
@@ -490,7 +493,7 @@ class SendAppJava(QWidget):
         ip_address = self.ip_address
         print(self.file_paths)
 
-        if self.config['android_encryption']:
+        if self.config_manager.get_config()['encryption']:
             password = self.password_input.text()
             if not self.password_input.text():
                 QMessageBox.critical(None, "Password Error", "Please enter a password.")

@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives import padding
 import os
 import base64
 import sys
-from constant import logger
+from loges import logger
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLineEdit, QDialog, QLabel, QGridLayout, QPushButton, QApplication, QSpacerItem, QSizePolicy, QMessageBox
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor, QScreen
@@ -432,4 +432,3 @@ class Decryptor(QWidget):
 #         print(f'Password entered: {password}')
 
 #     sys.exit(app.exec())
-
