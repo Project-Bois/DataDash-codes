@@ -71,6 +71,8 @@ if log_dir is None:
     raise RuntimeError("Unsupported OS!")
 
 log_file_path = os.path.join(log_dir, 'datadashlog.txt')
+if os.path.exists(log_file_path) and os.path.getsize(log_file_path) > (500 * 1024):
+    os.remove(log_file_path)
 
 logging_thread = LoggingThread(log_queue, log_file_path)
 logging_thread.start()

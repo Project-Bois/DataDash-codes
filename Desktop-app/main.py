@@ -164,6 +164,38 @@ class MainApp(QWidget):
         self.skip_version_check = skip_version_check
         self.network_thread = NetworkCheck()
         self.network_thread.start() #comment out after testing is over, lot of overhead on windows
+        self.version_thread = None
+        self.broadcast_app = None
+        self.receive_app = None
+        self.preferences_app = None
+
+    def cleanup(self):
+        # Stop all running threads
+        if self.network_thread and self.network_thread.isRunning():
+            self.network_thread.quit()
+            self.network_thread.wait()
+
+        if self.version_thread and self.version_thread.isRunning():
+            self.version_thread.quit()
+            self.version_thread.wait()
+
+        # Close all child windows
+        if self.broadcast_app:
+            self.broadcast_app.close()
+        if self.receive_app:
+            self.receive_app.close()
+        if self.preferences_app:
+            self.preferences_app.close()
+
+        # Cleanup config manager
+        if hasattr(self, 'config_manager'):
+            self.config_manager.quit()
+            self.config_manager.wait()
+
+    def closeEvent(self, event):
+        self.cleanup()
+        QApplication.quit()
+        event.accept()
 
     def on_config_ready(self):
         self.initUI(self.skip_version_check)
@@ -555,9 +587,9 @@ class MainApp(QWidget):
         if reply == QMessageBox.StandardButton.Open:
             self.openSettings()
 
-
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
     main = MainApp()
     main.show()
     sys.exit(app.exec())

@@ -2,8 +2,12 @@ package com.an.crossplatform;
 
 import android.content.Intent;
 import android.os.Bundle;
+import android.view.Window;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ProgressBar;
+import android.widget.TableLayout;
+import android.widget.TableRow;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -20,8 +24,8 @@ public class Decryptor extends AppCompatActivity {
 
     private ArrayList<String> encryptedFiles;
     private EditText passwordInput;
-    TextView decryptedFilesTextView;
     private Button decryptButton;
+    private TableLayout tableLayout;
     private int incorrectPasswordAttempts = 0;
     private ExecutorService executorService;
 
@@ -35,7 +39,7 @@ public class Decryptor extends AppCompatActivity {
 
         passwordInput = findViewById(R.id.editTextText2);
         decryptButton = findViewById(R.id.button);
-        decryptedFilesTextView = findViewById(R.id.textView2);
+        tableLayout = findViewById(R.id.tableLayout);
 
         decryptButton.setOnClickListener(v -> {
             String password = passwordInput.getText().toString();
@@ -43,14 +47,13 @@ public class Decryptor extends AppCompatActivity {
                 Toast.makeText(this, "Please enter a password.", Toast.LENGTH_SHORT).show();
                 return;
             }
+            decryptButton.setEnabled(false); // Disable the button to prevent spamming
             decryptFilesInBackground(password);
         });
     }
 
     private void decryptFilesInBackground(String password) {
-        // Create a new ExecutorService to run the decryption task in the background
         executorService = Executors.newSingleThreadExecutor();
-
         executorService.execute(() -> {
             runOnUiThread(() -> Toast.makeText(Decryptor.this, "Decryption started...", Toast.LENGTH_SHORT).show());
             decryptFiles(password);
@@ -58,40 +61,29 @@ public class Decryptor extends AppCompatActivity {
     }
 
     private void decryptFiles(String password) {
-        boolean allDecryptedSuccessfully = true; // Flag to track decryption status
-        boolean shouldStopDecryption = false; // Flag to stop decryption on incorrect attempt
-
-        runOnUiThread(() -> {
-            decryptedFilesTextView.setText("");
-        });
+        boolean allDecryptedSuccessfully = true;
+        boolean shouldStopDecryption = false;
 
         for (String filePath : encryptedFiles) {
+            if (shouldStopDecryption) break;
 
             File inputFile = new File(filePath);
+            if (inputFile.isDirectory()) continue;
 
-            if (inputFile.isDirectory()) {
-                continue;
-            }
-
-            // Remove the last 6 characters (".crypt") from the filename to get the output filename
             String outputFileName = filePath.substring(0, filePath.length() - 6);
             File outputFile = new File(inputFile.getParent(), new File(outputFileName).getName());
+
+            runOnUiThread(() -> addFileRow(filePath));
 
             try {
                 EncryptionUtils.decryptFile(password, inputFile, outputFile);
 
-                // If decryption is successful, append the filename to textView2
-                runOnUiThread(() -> {
-                    String currentText = decryptedFilesTextView.getText().toString();
-                    String newText = currentText + "\n" + outputFileName; // Append filename to the current text
-                    decryptedFilesTextView.setText(newText);
-                });
+                runOnUiThread(() -> updateProgress(filePath, 100));
 
             } catch (Exception e) {
-                allDecryptedSuccessfully = false; // Set flag to false if any decryption fails
+                allDecryptedSuccessfully = false;
                 incorrectPasswordAttempts++;
 
-                // If an exception occurs, delete the outputFile (if exists)
                 if (outputFile.exists()) {
                     outputFile.delete();
                 }
@@ -101,24 +93,56 @@ public class Decryptor extends AppCompatActivity {
                         Toast.makeText(this, "Password incorrect multiple times. Deleting encrypted files.", Toast.LENGTH_LONG).show();
                     });
                     deleteAllFiles();
-                    break; // Exit the loop after deleting files
+                    shouldStopDecryption = true;
+                    break;
                 }
 
                 runOnUiThread(() -> {
-                    Toast.makeText(this, "Incorrect Password, Remaining attempts: "+(3-incorrectPasswordAttempts), Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "Incorrect Password, Remaining attempts: " + (3 - incorrectPasswordAttempts), Toast.LENGTH_LONG).show();
+                });
+                // Enable the button to allow the user to try again and clear the password field and table layout
+                runOnUiThread(() -> {
+                    decryptButton.setEnabled(true);
+                    passwordInput.setText("");
+                    tableLayout.removeAllViews();
                 });
                 e.printStackTrace();
                 break;
             }
         }
 
-
-        // Show toast if all files were decrypted successfully
         if (allDecryptedSuccessfully) {
             runOnUiThread(() -> {
                 Toast.makeText(this, "All files decrypted successfully!", Toast.LENGTH_SHORT).show();
             });
             deleteEncryptedFiles();
+        }
+    }
+
+    private void addFileRow(String filePath) {
+        TableRow tableRow = new TableRow(this);
+        TextView filePathTextView = new TextView(this);
+        filePathTextView.setText(filePath);
+        filePathTextView.setLayoutParams(new TableRow.LayoutParams(0, TableRow.LayoutParams.WRAP_CONTENT, 0.8f));
+
+        ProgressBar progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar.setLayoutParams(new TableRow.LayoutParams(0, TableRow.LayoutParams.WRAP_CONTENT, 0.2f));
+        progressBar.setProgress(0);
+        progressBar.setTag(filePath);
+
+        tableRow.addView(filePathTextView);
+        tableRow.addView(progressBar);
+        tableLayout.addView(tableRow);
+    }
+
+    private void updateProgress(String filePath, int progress) {
+        for (int i = 0; i < tableLayout.getChildCount(); i++) {
+            TableRow row = (TableRow) tableLayout.getChildAt(i);
+            ProgressBar progressBar = (ProgressBar) row.getChildAt(1);
+            if (filePath.equals(progressBar.getTag())) {
+                progressBar.setProgress(progress);
+                break;
+            }
         }
     }
 
@@ -130,18 +154,18 @@ public class Decryptor extends AppCompatActivity {
             }
         }
 
-        // Shut down the executor to release resources
         if (executorService != null && !executorService.isShutdown()) {
             executorService.shutdown();
         }
 
         runOnUiThread(() -> {
-            finish();
+            TransferCompleteActivity transferCompleteActivity = new TransferCompleteActivity(Decryptor.this);
+            transferCompleteActivity.requestWindowFeature(Window.FEATURE_NO_TITLE);
+            transferCompleteActivity.show();
         });
     }
 
     private void deleteAllFiles() {
-        // Delete All files, including folders
         for (String filePath : encryptedFiles) {
             File inputFile = new File(filePath);
             if (inputFile.exists()) {
@@ -149,17 +173,17 @@ public class Decryptor extends AppCompatActivity {
             }
         }
 
-        // Shut down the executor to release resources
         if (executorService != null && !executorService.isShutdown()) {
             executorService.shutdown();
         }
 
         runOnUiThread(() -> {
-            finish();
+            TransferCompleteActivity transferCompleteActivity = new TransferCompleteActivity(Decryptor.this);
+            transferCompleteActivity.requestWindowFeature(Window.FEATURE_NO_TITLE);
+            transferCompleteActivity.show();
         });
     }
 
-    // Recursive method for deleting files and directories
     private void deleteRecursive(File fileOrDir) {
         if (fileOrDir.isDirectory()) {
             File[] children = fileOrDir.listFiles();
@@ -169,6 +193,6 @@ public class Decryptor extends AppCompatActivity {
                 }
             }
         }
-        fileOrDir.delete(); // Deletes the file or empty directory
+        fileOrDir.delete();
     }
 }

@@ -191,16 +191,49 @@ class UpdateManager(QThread):
     def get_platform_info(self):
         if platform.system() == 'Windows':
             platform_os = 'windows'
-            possible_paths = [
-                os.path.join(os.getenv('USERPROFILE'), 'Downloads'),
-                os.path.join(os.getenv('HOMEDRIVE'), os.getenv('HOMEPATH'), 'Downloads'),
-                os.path.expanduser('~\\Downloads')
-            ]
+            # Try multiple methods to find Downloads folder without using Shell API
+            possible_paths = []
+            
+            # Method 1: Environment variables
+            if 'USERPROFILE' in os.environ:
+                possible_paths.append(os.path.join(os.environ['USERPROFILE'], 'Downloads'))
+            
+            # Method 2: Constructed from HOMEDRIVE and HOMEPATH
+            if 'HOMEDRIVE' in os.environ and 'HOMEPATH' in os.environ:
+                possible_paths.append(os.path.join(os.environ['HOMEDRIVE'], 
+                                                 os.environ['HOMEPATH'], 
+                                                 'Downloads'))
+            
+            # Method 3: User's home directory
+            possible_paths.append(os.path.expanduser('~\\Downloads'))
+            
+            # Method 4: Common fallback paths
+            possible_paths.extend([
+                os.path.join(os.path.expanduser('~'), 'Desktop'),
+                os.path.join(os.path.expanduser('~'), 'Documents'),
+                os.path.dirname(os.path.abspath(__file__))
+            ])
+            
+            # Try Windows Registry as a last resort (safer than Shell32)
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
+                                  r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders') as key:
+                    downloads_path = winreg.QueryValueEx(key, '{374DE290-123F-4565-9164-39C4925E467B}')[0]
+                    if downloads_path and os.path.exists(downloads_path):
+                        possible_paths.insert(0, downloads_path)
+            except Exception:
+                logger.debug("Could not get Downloads folder from Registry")
+            
+            # Find first existing path
             download_path = next((path for path in possible_paths if os.path.exists(path)), None)
+            
             if not download_path:
-                logger.error("Could not find Windows Downloads folder!")
-                return None
+                logger.warning("Could not find Downloads folder, using application directory")
+                download_path = os.path.dirname(os.path.abspath(__file__))
+            
             file_extension = '.exe'
+            
         elif platform.system() == 'Linux':
             platform_os = 'linux'
             download_path = os.path.join(os.path.expanduser('~'), 'Downloads')
@@ -275,6 +308,7 @@ class PreferencesApp(QWidget):
         self.original_preferences = {}
         self.initUI()
         self.setFixedSize(525, 600)
+        self.main_app = None
 
     def setup_update_manager_signals(self):
         self.update_manager.version_check_complete.connect(self.show_version_dialog)
@@ -1174,6 +1208,30 @@ class PreferencesApp(QWidget):
         elif channel == "stable":
             QDesktopServices.openUrl(QUrl("https://datadashshare.vercel.app/download"))
             logger.info("Opened stable page")
+
+    def cleanup(self):
+        # Stop threads
+        if self.update_manager:
+            self.update_manager.quit()
+            self.update_manager.wait()
+        
+        if self.config_manager:
+            self.config_manager.quit()
+            self.config_manager.wait()
+
+        # Close child windows
+        if self.main_app:
+            self.main_app.close()
+
+        # Close any open dialogs
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.close()
+
+    def closeEvent(self, event):
+        logger.info("Shutting down Preferences window")
+        self.cleanup()
+        QApplication.quit()
+        event.accept()
 
 
 if __name__ == '__main__':

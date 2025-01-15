@@ -1,6 +1,7 @@
 package com.an.crossplatform;
 
 import android.annotation.SuppressLint;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.AsyncTask;
@@ -9,9 +10,11 @@ import android.os.Environment;
 import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.View;
+import android.view.Window;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ProgressBar;
+import android.widget.SeekBar;
 import android.widget.Toast;
 
 import androidx.activity.OnBackPressedCallback;
@@ -90,12 +93,21 @@ public class SendFileActivityPython extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_send);
+        //forceReleasePort();
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                Toast.makeText(SendFileActivityPython.this,  "Back navigation is disabled, Please Restart the App", Toast.LENGTH_SHORT).show();
-                // Do nothing to disable back navigation
+                new AlertDialog.Builder(SendFileActivityPython.this)
+                        .setTitle("Exit")
+                        .setMessage("Are you sure you want to cancel the transfer?")
+                        .setPositiveButton("Yes", (dialog, which) -> {
+                            dialog.dismiss();
+                            closeAllSockets();
+                            Toast.makeText(SendFileActivityPython.this,  "Device Disconnected", Toast.LENGTH_SHORT).show();
+                        })
+                        .setNegativeButton("No", (dialog, which) -> dialog.dismiss())
+                        .show();
             }
         });
 
@@ -509,7 +521,6 @@ public class SendFileActivityPython extends AppCompatActivity {
         public void run() {
             // Initialize connection
             try {
-                forceReleasePort(57341);
                 socket = new Socket();
                 socket.connect(new InetSocketAddress(ip, 57341), 10000);
                 FileLogger.log("SendFileActivity", "Socket connected: " + socket.isConnected());
@@ -561,10 +572,13 @@ public class SendFileActivityPython extends AppCompatActivity {
                         sendButton.setEnabled(false);
                         //Toast.makeText(SendFileActivityPython.this, "Sending Completed", Toast.LENGTH_SHORT).show();
 
-                        // Launch TransferCompleteActivity
-                        Intent intent = new Intent(SendFileActivityPython.this, TransferCompleteActivity.class);
-                        startActivity(intent);
-                        finish(); // Close current activity
+//                        // Launch TransferCompleteActivity
+//                        Intent intent = new Intent(SendFileActivityPython.this, TransferCompleteActivity.class);
+//                        startActivity(intent);
+//                        finish(); // Close current activity
+                        TransferCompleteActivity transferCompleteActivity = new TransferCompleteActivity(SendFileActivityPython.this);
+                        transferCompleteActivity.requestWindowFeature(Window.FEATURE_NO_TITLE);
+                        transferCompleteActivity.show();
                     }
                 });
             } catch (IOException e) {
@@ -799,30 +813,6 @@ public class SendFileActivityPython extends AppCompatActivity {
             }
         }
 
-        private void forceReleasePort(int port) {
-            try {
-                // Find and kill process using the port
-                Process process = Runtime.getRuntime().exec("lsof -i tcp:" + port);
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                String line;
-
-                while ((line = reader.readLine()) != null) {
-                    if (line.contains("LISTEN")) {
-                        String[] parts = line.split("\\s+");
-                        if (parts.length > 1) {
-                            String pid = parts[1];
-                            Runtime.getRuntime().exec("kill -9 " + pid);
-                            FileLogger.log("SendFileActivity", "Killed process " + pid + " using port " + port);
-                        }
-                    }
-                }
-
-                // Wait briefly for port to be fully released
-                Thread.sleep(1000);
-            } catch (Exception e) {
-                FileLogger.log("SendFileActivity", "Error releasing port: " + port, e);
-            }
-        }
     }
 
 
@@ -847,33 +837,61 @@ public class SendFileActivityPython extends AppCompatActivity {
         }
         return encryption;
     }
+    private void forceReleasePort() {
+        int port1 =57341;
+        try {
+            // Find and kill process using the port
+            Process process = Runtime.getRuntime().exec("lsof -i tcp:" + port1);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.contains("LISTEN")) {
+                    String[] parts = line.split("\\s+");
+                    if (parts.length > 1) {
+                        String pid = parts[1];
+                        Runtime.getRuntime().exec("kill -9 " + pid);
+                        FileLogger.log("ReceiveFileActivity", "Killed process " + pid + " using port " + port1);
+                    }
+                }
+            }
+
+            // Wait briefly for port to be fully released
+            Thread.sleep(500);
+        } catch (Exception e) {
+            FileLogger.log("ReceiveFileActivity", "Error releasing port: " + port1, e);
+        }
+    }
+
+    private void closeAllSockets() {
+        try {
+            // Close socket-related resources
+            if (dos != null) {
+                dos.close();
+                FileLogger.log("SendFileActivityPython", "DataOutputStream closed");
+            }
+            if (dis != null) {
+                dis.close();
+                FileLogger.log("SendFileActivityPython", "DataInputStream closed");
+            }
+            if (socket != null && !socket.isClosed()) {
+                socket.close();
+                FileLogger.log("SendFileActivityPython", "Socket closed");
+            }
+
+            // Shutdown executor
+            executorService.shutdown();
+            FileLogger.log("SendFileActivityPython", "ExecutorService shutdown");
+
+            finish(); // Close the activity
+        } catch (IOException e) {
+            FileLogger.log("SendFileActivityPython", "Error closing sockets", e);
+        }
+    }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        // Close the socket connection when the activity is destroyed
-        try {
-            if (socket != null) {
-                socket.close();
-                FileLogger.log("SendFileActivity", "Socket closed");
-            }
-        } catch (IOException e) {
-            FileLogger.log("SendFileActivity", "Error closing socket", e);
-        }
-        executorService.shutdown();  // Clean up background threads
-    }
-
-    @Override
-    public void onBackPressed() {
-        super.onBackPressed();
-        // Close sockets on activity destruction
-        try {
-            if (socket != null) {
-                socket.close();
-                FileLogger.log("SendFileActivity", "Socket closed");
-            }
-        } catch (IOException e) {
-            FileLogger.log("SendFileActivity", "Error closing socket", e);
-        }
+        closeAllSockets();
     }
 }

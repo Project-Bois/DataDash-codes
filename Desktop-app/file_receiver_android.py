@@ -4,9 +4,9 @@ import struct
 import json
 from loges import logger
 from PyQt6 import QtCore
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMetaObject,QTimer
-from PyQt6.QtWidgets import QMessageBox, QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication,QPushButton,QHBoxLayout
-from PyQt6.QtGui import QScreen,QMovie,QFont,QKeySequence,QKeyEvent
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMetaObject, QTimer
+from PyQt6.QtWidgets import QMessageBox, QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication, QPushButton, QHBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QStyledItemDelegate, QSizePolicy
+from PyQt6.QtGui import QScreen, QMovie, QFont, QKeyEvent, QKeySequence
 from constant import ConfigManager
 from crypt_handler import decrypt_file, Decryptor
 import subprocess
@@ -15,16 +15,53 @@ import time
 import shutil
 from portsss import RECEIVER_DATA_ANDROID, CHUNK_SIZE_ANDROID
 
+class ProgressBarDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        if index.column() == 3:
+            progress = index.data(Qt.ItemDataRole.UserRole)
+            if progress is not None:
+                progressBar = QProgressBar()
+                progressBar.setStyleSheet("""
+                    QProgressBar {
+                        background-color: #2f3642;
+                        color: white;
+                        border: 1px solid #4b5562;
+                        border-radius: 5px;
+                        text-align: center;
+                    }
+                    QProgressBar::chunk {
+                        background-color: #4CAF50;
+                    }
+                """)
+                progressBar.setGeometry(option.rect)
+                progressBar.setValue(progress)
+                progressBar.setTextVisible(True)
+                painter.save()
+                painter.translate(option.rect.topLeft())
+                progressBar.render(painter)
+                painter.restore()
+            return
+        super().paint(painter, option, index)
+
+    def createEditor(self, parent, option, index):
+        return None  # Disable editing
+
 class ReceiveWorkerJava(QThread):
-    progress_update = pyqtSignal(int)
+    progress_update = pyqtSignal(int)  # Overall progress
+    file_progress_update = pyqtSignal(str, int)  # Individual file progress (filename, progress)
     decrypt_signal = pyqtSignal(list)
     receiving_started = pyqtSignal()
     transfer_finished = pyqtSignal()
     password = None
+    update_files_table_signal = pyqtSignal(list)  # Add signal for updating files table
+    file_renamed_signal = pyqtSignal(str, str)  # old_name, new_name
+    transfer_stats_update = pyqtSignal(float, float, float)
+    file_count_update = pyqtSignal(int, int, int)
 
     def __init__(self, client_ip):
         super().__init__()
         self.client_skt = None
+        self.server_skt = None
         self.server_skt = None
         self.encrypted_files = []
         self.broadcasting = True
@@ -35,6 +72,14 @@ class ReceiveWorkerJava(QThread):
         self.config_manager = ConfigManager()
         self.config_manager.start()
         logger.debug(f"Client IP address stored: {self.store_client_ip}")
+        self.total_files = 0
+        self.files_received = 0
+        self.start_time = None
+        self.last_update_time = None
+        self.last_bytes_received = 0
+        self.total_bytes_received = 0
+        self.total_files = 0
+        self.files_received = 0
 
     def initialize_connection(self):
         """Initialize server socket with proper reuse settings"""
@@ -110,6 +155,14 @@ class ReceiveWorkerJava(QThread):
         self.broadcasting = False
         logger.debug("File reception started.")
         is_folder_transfer = False
+        self.start_time = time.time()
+        self.last_update_time = time.time()
+        total_bytes = 0
+        received_total = 0
+        folder_received_bytes = 0
+        encrypted_transfer = False
+        file_name = None  # Initialize file_name
+        original_filename = None  # Initialize original_filename
 
         while True:
             try:
@@ -164,7 +217,6 @@ class ReceiveWorkerJava(QThread):
                         if is_folder_transfer:
                             self.destination_folder = self.create_folder_structure(self.metadata)
                         else:
-                            # For single files, use default directory
                             self.destination_folder = self.config_manager.get_config()["save_to_directory"]
                         continue
 
@@ -189,6 +241,7 @@ class ReceiveWorkerJava(QThread):
                         received_size = 0
                         remaining = file_size
                         while remaining > 0:
+                            current_time = time.time()
                             chunk_size = min(CHUNK_SIZE_ANDROID, remaining)
                             data = self.client_skt.recv(chunk_size)
                             if not data:
@@ -196,11 +249,36 @@ class ReceiveWorkerJava(QThread):
                             f.write(data)
                             received_size += len(data)
                             remaining -= len(data)
-                            progress = int(received_size * 100 / file_size)
-                            self.progress_update.emit(progress)
+                            received_total += len(data)
+                            self.total_bytes_received = received_total
+
+                            # Calculate transfer statistics every 0.5 seconds
+                            if current_time - self.last_update_time >= 0.5:
+                                elapsed = current_time - self.start_time
+                                if elapsed > 0:
+                                    speed = (received_size / (1024 * 1024)) / elapsed  # MB/s
+                                    eta = (file_size - received_size) / (received_size / elapsed) if received_size > 0 else 0
+                                else:
+                                    speed = 0
+                                    eta = 0
+                                self.transfer_stats_update.emit(speed, eta, elapsed)
+                                self.last_update_time = current_time
+
+                            # Calculate and emit progress
+                            file_progress = int((received_size * 100) / file_size) if file_size > 0 else 0
+                            file_progress = min(file_progress, 100)
+                            self.file_progress_update.emit(os.path.basename(file_name), file_progress)
+                            
+                            # Overall progress can be implemented if needed
+                            self.progress_update.emit(file_progress)
 
                     if encrypted_transfer:
                         self.encrypted_files.append(full_file_path)
+
+                    if file_name != 'metadata.json':
+                        self.files_received += 1
+                        files_pending = self.total_files - self.files_received
+                        self.file_count_update.emit(self.total_files, self.files_received, files_pending)
 
                 except Exception as e:
                     logger.error(f"Error saving file {file_name}: {str(e)}")
@@ -227,7 +305,29 @@ class ReceiveWorkerJava(QThread):
         received_data = self._receive_data(self.client_skt, file_size)
         try:
             metadata_json = received_data.decode('utf-8')
-            return json.loads(metadata_json)
+            metadata = json.loads(metadata_json)
+            
+            # Only emit the folder information if it's a folder transfer
+            if metadata and metadata[-1].get('base_folder_name', ''):
+                # Send only the folder metadata entry
+                self.update_files_table_signal.emit([metadata[-1]])
+            else:
+                # Send full metadata for individual files
+                self.update_files_table_signal.emit(metadata)
+                
+            # Count total files from metadata
+            if metadata and metadata[-1].get('base_folder_name', ''):
+                # For folder transfers, count all files (excluding folders and .delete)
+                self.total_files = sum(1 for item in metadata[:-1] 
+                                     if not item['path'].endswith('/') and item['path'] != '.delete')
+            else:
+                # For individual files
+                self.total_files = len(metadata)
+                
+            self.file_count_update.emit(self.total_files, 0, self.total_files)
+            
+            return metadata
+            
         except UnicodeDecodeError as e:
             logger.error("Unicode decode error: %s", e)
             raise
@@ -356,9 +456,16 @@ class ReceiveAppPJava(QWidget):
         
         self.file_receiver = ReceiveWorkerJava(client_ip)
         self.file_receiver.progress_update.connect(self.updateProgressBar)
+        self.file_receiver.file_progress_update.connect(self.update_file_progress)  # Connect file progress signal
         self.file_receiver.decrypt_signal.connect(self.decryptor_init)
         self.file_receiver.receiving_started.connect(self.show_progress_bar)
         self.file_receiver.transfer_finished.connect(self.onTransferFinished)
+        self.file_receiver.update_files_table_signal.connect(self.update_files_table)
+        self.file_receiver.file_renamed_signal.connect(self.handle_file_rename)
+        # Connect the stats update signal
+        self.file_receiver.transfer_stats_update.connect(self.update_transfer_stats)
+        # Connect the file count update signal
+        self.file_receiver.file_count_update.connect(self.updateFileCounts)
         #com.an.Datadash
        
         self.typewriter_timer = QTimer(self)
@@ -367,6 +474,7 @@ class ReceiveAppPJava(QWidget):
 
         QMetaObject.invokeMethod(self.file_receiver, "start", Qt.ConnectionType.QueuedConnection)
         self.config_manager = ConfigManager()
+        self.main_window = None
 
     def initUI(self):
         self.setWindowTitle('Receive File')
@@ -389,34 +497,121 @@ class ReceiveAppPJava(QWidget):
         layout = QVBoxLayout()
         layout.setSpacing(10)  # Set spacing between widgets
         layout.setContentsMargins(10, 10, 10, 10)  # Add some margins around the layout
+        #com.an.Datadash
 
-        # Loading label with the movie (GIF)
+        # Top section with animation and label
+        top_layout = QHBoxLayout()
+        
         self.loading_label = QLabel(self)
         self.loading_label.setStyleSheet("QLabel { background-color: transparent; border: none; }")
         self.receiving_movie = QMovie(receiving_gif_path)
-        self.success_movie = QMovie(success_gif_path)  # New success GIF
-        self.receiving_movie.setScaledSize(QtCore.QSize(100, 100))
-        self.success_movie.setScaledSize(QtCore.QSize(100, 100))  # Set size for success GIF
+        self.success_movie = QMovie(success_gif_path)
+        self.receiving_movie.setScaledSize(QtCore.QSize(50, 50))  # Reduced size
+        self.success_movie.setScaledSize(QtCore.QSize(50, 50))
         self.loading_label.setMovie(self.receiving_movie)
         self.receiving_movie.start()
-        layout.addWidget(self.loading_label, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
-
-        # Text label "Waiting for file..." (for typewriter effect)
+        
         self.label = QLabel("", self)
         self.label.setStyleSheet("""
             QLabel {
                 color: white;
-                font-size: 28px;
+                font-size: 24px;
                 background: transparent;
                 border: none;
                 font-weight: bold;
             }
         """)
-        layout.addWidget(self.label, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        
+        top_layout.addWidget(self.loading_label)
+        top_layout.addWidget(self.label)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
 
-        # Progress bar
+        # Files table - with fixed height
+        self.files_table = QTableWidget()
+        self.files_table.setFixedHeight(200)  # Set fixed height to prevent overflow
+        self.files_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.files_table.setColumnCount(4)
+        self.files_table.setShowGrid(True)
+        self.files_table.verticalHeader().setVisible(False)
+        self.files_table.setHorizontalHeaderLabels(['Sr No.', 'File Name', 'Size', 'Progress'])
+        self.files_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #2f3642;
+                color: white;
+                border: 1px solid #4b5562;
+                border-radius: 10px;
+                gridline-color: #4b5562;
+                padding: 5px;
+            }
+            QHeaderView::section {
+                background-color: #1f242d;
+                color: white;
+                padding: 8px;
+                border: 1px solid #4b5562;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #4b5562;
+            }
+            QTableWidget::item:selected {
+                background-color: #3d4452;
+            }
+        """)
+        
+        # Configure columns
+        self.files_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.files_table.setColumnWidth(0, 60)
+        
+        # File Name column - expanding width
+        self.files_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        
+        # Size column - fixed width
+        self.files_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.files_table.setColumnWidth(2, 100)
+        
+        # Progress column - fixed width
+        self.files_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.files_table.setColumnWidth(3, 200)
+        
+        self.files_table.setItemDelegate(ProgressBarDelegate())
+        layout.addWidget(self.files_table)
+
+        # Stats section with consistent spacing
+        stats_layout = QVBoxLayout()
+        stats_layout.setSpacing(8)  # Consistent spacing between elements
+
+        # File counts label
+        self.file_counts_label = QLabel("Total files: 0 | Completed: 0 | Pending: 0")
+        self.file_counts_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 14px;
+                background-color: transparent;
+                padding: 3px 0;
+            }
+        """)
+        stats_layout.addWidget(self.file_counts_label)
+
+        # Transfer stats label
+        self.transfer_stats_label = QLabel()
+        self.transfer_stats_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 14px;
+                background: transparent;
+                padding: 3px 0;
+            }
+        """)
+        self.transfer_stats_label.setVisible(False)
+        stats_layout.addWidget(self.transfer_stats_label)
+
+        # Add the stats layout to main layout
+        layout.addLayout(stats_layout)
+
+        # Overall progress bar
         self.progress_bar = QProgressBar()
-        #com.an.Datadash
         self.progress_bar.setStyleSheet("""
             QProgressBar {
                 background-color: #2f3642;
@@ -424,6 +619,8 @@ class ReceiveAppPJava(QWidget):
                 border: 1px solid #4b5562;
                 border-radius: 5px;
                 text-align: center;
+                height: 20px;
+                margin: 5px 0;
             }
             QProgressBar::chunk {
                 background-color: #4CAF50;
@@ -431,22 +628,27 @@ class ReceiveAppPJava(QWidget):
         """)
         layout.addWidget(self.progress_bar)
 
+        # Buttons
+        buttons_layout = QHBoxLayout()
         # Open directory button
         self.open_dir_button = self.create_styled_button('Open Receiving Directory')
         self.open_dir_button.clicked.connect(self.open_receiving_directory)
         self.open_dir_button.setVisible(False)  # Initially hidden
-        layout.addWidget(self.open_dir_button)
+        buttons_layout.addWidget(self.open_dir_button)
+        #com.an.Datadash
 
         # Keep them disabled until the file transfer is completed
         self.close_button = self.create_styled_button('Close')  # Apply styling here
         self.close_button.setVisible(False)
         self.close_button.clicked.connect(self.close)
-        layout.addWidget(self.close_button)
+        buttons_layout.addWidget(self.close_button)
 
         self.mainmenu_button = self.create_styled_button('Main Menu')
         self.mainmenu_button.setVisible(False)
         self.mainmenu_button.clicked.connect(self.openMainWindow)
-        layout.addWidget(self.mainmenu_button)
+        buttons_layout.addWidget(self.mainmenu_button)
+
+        layout.addLayout(buttons_layout)
 
         self.setLayout(layout)
 
@@ -522,6 +724,64 @@ class ReceiveAppPJava(QWidget):
     def updateProgressBar(self, value):
         self.progress_bar.setValue(value)
 
+    def update_file_progress(self, filename, progress):
+        """Update progress for a specific file in the table"""
+        for row in range(self.files_table.rowCount()):
+            if self.files_table.item(row, 1).text() == filename:
+                progress_item = QTableWidgetItem()
+                progress_item.setData(Qt.ItemDataRole.UserRole, progress)
+                self.files_table.setItem(row, 3, progress_item)
+                break
+
+    def handle_file_rename(self, old_name, new_name):
+        """Track renamed files - now handles both encrypted and unencrypted files"""
+        self.file_name_map[old_name] = new_name
+        # Update the table with the new filename (without .crypt extension for encrypted files)
+        for row in range(self.files_table.rowCount()):
+            if self.files_table.item(row, 1).text() == os.path.basename(old_name):
+                display_name = os.path.basename(new_name)
+                if display_name.endswith('.crypt'):
+                    display_name = display_name[:-6]  # Remove .crypt extension for display
+                self.files_table.item(row, 1).setText(display_name)
+                self.files_table.item(row, 1).setToolTip(new_name)
+                break
+
+    def update_files_table(self, metadata):
+        """Update table with files from metadata"""
+        self.files_table.setRowCount(0)
+        sr_no = 1  # Initialize serial number counter
+        
+        for file_info in metadata:
+            if file_info.get('path') == '.delete':
+                continue
+                
+            row = self.files_table.rowCount()
+            self.files_table.insertRow(row)
+            
+            sr_item = QTableWidgetItem(str(sr_no))
+            sr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.files_table.setItem(row, 0, sr_item)
+            
+            # File name
+            name_item = QTableWidgetItem(os.path.basename(file_info['path']))
+            self.files_table.setItem(row, 1, name_item)
+            
+            # Size
+            size = file_info.get('size', 2)
+            if size >= 1024 * 1024:  # MB
+                size_str = f"{size / (1024 * 1024):.2f} MB"
+            elif size >= 1024:  # KB 
+                size_str = f"{size / 1024:.2f} KB"
+            else:  # Bytes
+                size_str = f"{size} B"
+            self.files_table.setItem(row, 2, QTableWidgetItem(size_str))
+            
+            # Progress (initially 0)
+            progress_item = QTableWidgetItem()
+            progress_item.setData(Qt.ItemDataRole.UserRole, 0)
+            self.files_table.setItem(row, 3, progress_item)
+            
+            sr_no += 1  # Increment serial number
 
     def change_gif_to_success(self):
         self.receiving_movie.stop()
@@ -547,43 +807,43 @@ class ReceiveAppPJava(QWidget):
 
                 elif current_os == 'Linux':
                     file_managers = [
-                        ["xdg-open", receiving_dir],
-                        ["xdg-mime", "open", receiving_dir],
+                        # ["xdg-open", receiving_dir],
+                        # ["xdg-mime", "open", receiving_dir],
                         ["dbus-send", "--print-reply", "--dest=org.freedesktop.FileManager1",
                          "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowFolders",
-                         "array:string:" + receiving_dir, "string:"],
-                        ["gio", "open", receiving_dir],
-                        ["gvfs-open", receiving_dir],
-                        ["kde-open", receiving_dir],
-                        ["kfmclient", "exec", receiving_dir],
-                        ["nautilus", receiving_dir],
-                        ["dolphin", receiving_dir],
-                        ["thunar", receiving_dir],
-                        ["pcmanfm", receiving_dir],
-                        ["krusader", receiving_dir],
-                        ["mc", receiving_dir],
-                        ["nemo", receiving_dir],
-                        ["caja", receiving_dir],
-                        ["konqueror", receiving_dir],
-                        ["gwenview", receiving_dir],
-                        ["gimp", receiving_dir],
-                        ["eog", receiving_dir],
-                        ["feh", receiving_dir],
-                        ["gpicview", receiving_dir],
-                        ["mirage", receiving_dir],
-                        ["ristretto", receiving_dir],
-                        ["viewnior", receiving_dir],
-                        ["gthumb", receiving_dir],
-                        ["nomacs", receiving_dir],
-                        ["geeqie", receiving_dir],
-                        ["gwenview", receiving_dir],
-                        ["gpicview", receiving_dir],
-                        ["mirage", receiving_dir],
-                        ["ristretto", receiving_dir],
-                        ["viewnior", receiving_dir],
-                        ["gthumb", receiving_dir],
-                        ["nomacs", receiving_dir],
-                        ["geeqie", receiving_dir],
+                         "array:string:" + "file://" + receiving_dir, "string:"]
+                        # ["gio", "open", receiving_dir],
+                        # ["gvfs-open", receiving_dir],
+                        # ["kde-open", receiving_dir],
+                        # ["kfmclient", "exec", receiving_dir],
+                        # ["nautilus", receiving_dir],
+                        # ["dolphin", receiving_dir],
+                        # ["thunar", receiving_dir],
+                        # ["pcmanfm", receiving_dir],
+                        # ["krusader", receiving_dir],
+                        # ["mc", receiving_dir],
+                        # ["nemo", receiving_dir],
+                        # ["caja", receiving_dir],
+                        # ["konqueror", receiving_dir],
+                        # ["gwenview", receiving_dir],
+                        # ["gimp", receiving_dir],
+                        # ["eog", receiving_dir],
+                        # ["feh", receiving_dir],
+                        # ["gpicview", receiving_dir],
+                        # ["mirage", receiving_dir],
+                        # ["ristretto", receiving_dir],
+                        # ["viewnior", receiving_dir],
+                        # ["gthumb", receiving_dir],
+                        # ["nomacs", receiving_dir],
+                        # ["geeqie", receiving_dir],
+                        # ["gwenview", receiving_dir],
+                        # ["gpicview", receiving_dir],
+                        # ["mirage", receiving_dir],
+                        # ["ristretto", receiving_dir],
+                        # ["viewnior", receiving_dir],
+                        # ["gthumb", receiving_dir],
+                        # ["nomacs", receiving_dir],
+                        # ["geeqie", receiving_dir],
                     ]
 
                     success = False
@@ -626,33 +886,55 @@ class ReceiveAppPJava(QWidget):
         self.change_gif_to_success()  # Change GIF to success animation
         self.close_button.setVisible(True)
 
+    def update_transfer_stats(self, speed, eta, elapsed):
+        """Update the transfer statistics label"""
+        if not self.transfer_stats_label.isVisible():
+            self.transfer_stats_label.setVisible(True)
+            
+        eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
+        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        stats_text = f"Speed: {speed:.2f} MB/s | ETA: {eta_str} | Elapsed: {elapsed_str}"
+        self.transfer_stats_label.setText(stats_text)
+
+    def updateFileCounts(self, total_files, files_received, files_pending):
+        """Update the file counts label with current transfer progress"""
+        self.file_counts_label.setText(
+            f"Total files: {total_files} | Completed: {files_received} | Pending: {files_pending}"
+        )
+
     def closeEvent(self, event):
-        """Handle application close event"""
-        try:
-            # Stop the typewriter effect
-            if hasattr(self, 'typewriter_timer'):
-                self.typewriter_timer.stop()
-                
-            # Stop file receiver and cleanup
-            if hasattr(self, 'file_receiver'):
-                self.file_receiver.stop()
-                self.file_receiver.close_connection()
-                
-                # Ensure thread is properly terminated
-                if not self.file_receiver.wait(3000):  # Wait up to 3 seconds
-                    self.file_receiver.terminate()
-                    self.file_receiver.wait()
-                    
-            # Stop any running movies
-            if hasattr(self, 'receiving_movie'):
-                self.receiving_movie.stop()
-            if hasattr(self, 'success_movie'):
-                self.success_movie.stop()
-                
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
-        finally:
-            event.accept()
+        logger.info("Shutting down ReceiveAppPJava")
+        self.cleanup()
+        QApplication.quit()
+        event.accept()
+
+    def cleanup(self):
+        logger.info("Cleaning up ReceiveAppPJava resources")
+        
+        # Stop typewriter effect
+        if hasattr(self, 'typewriter_timer'):
+            self.typewriter_timer.stop()
+            
+        # Stop file receiver and cleanup
+        if hasattr(self, 'file_receiver'):
+            self.file_receiver.stop()
+            self.file_receiver.close_connection()
+            
+            # Ensure thread is properly terminated
+            if not self.file_receiver.wait(3000):  # Wait up to 3 seconds
+                self.file_receiver.terminate()
+                self.file_receiver.wait()
+            
+        # Stop any running movies
+        if hasattr(self, 'receiving_movie'):
+            self.receiving_movie.stop()
+        if hasattr(self, 'success_movie'):
+            self.success_movie.stop()
+
+        # Close main window if it exists
+        if self.main_window:
+
+            self.main_window.close()
 
     def __del__(self):
         """Ensure cleanup on object destruction"""
@@ -669,6 +951,6 @@ class ReceiveAppPJava(QWidget):
 if __name__ == '__main__':
     import sys
     app = QApplication(sys.argv)
-    receive_app = ReceiveAppPJava()
+    receive_app = ReceiveAppPJava("127.0.0.1")
     receive_app.show()
     app.exec()

@@ -1,6 +1,7 @@
 package com.an.crossplatform;
 
 import android.annotation.SuppressLint;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.icu.text.LocaleDisplayNames;
 import android.net.Uri;
@@ -95,12 +96,22 @@ public class SendFileActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_send);
+        //forceReleasePort();
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                Toast.makeText(SendFileActivity.this,  "Back navigation is disabled, Please Restart the App", Toast.LENGTH_SHORT).show();
-                // Do nothing to disable back navigation
+
+                new AlertDialog.Builder(SendFileActivity.this)
+                        .setTitle("Exit")
+                        .setMessage("Are you sure you want to cancel the transfer?")
+                        .setPositiveButton("Yes", (dialog, which) -> {
+                            dialog.dismiss();
+                            closeAllSockets();
+                            Toast.makeText(SendFileActivity.this,  "Device Disconnected", Toast.LENGTH_SHORT).show();
+                        })
+                        .setNegativeButton("No", (dialog, which) -> dialog.dismiss())
+                        .show();
             }
         });
 
@@ -533,7 +544,6 @@ public class SendFileActivity extends AppCompatActivity {
         @Override
         public void run() {
             try {
-                forceReleasePort(FILE_TRANSFER_PORT);
                 socket = new Socket();
                 socket.setReuseAddress(true); // Add this to prevent port binding issues
                 FileLogger.log("SendFileActivity", "Attempting connection to " + ip + ":" + FILE_TRANSFER_PORT);
@@ -827,29 +837,31 @@ public class SendFileActivity extends AppCompatActivity {
             }
         }
 
-        private void forceReleasePort(int port) {
-            try {
-                // Find and kill process using the port
-                Process process = Runtime.getRuntime().exec("lsof -i tcp:" + port);
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                String line;
+    }
 
-                while ((line = reader.readLine()) != null) {
-                    if (line.contains("LISTEN")) {
-                        String[] parts = line.split("\\s+");
-                        if (parts.length > 1) {
-                            String pid = parts[1];
-                            Runtime.getRuntime().exec("kill -9 " + pid);
-                            FileLogger.log("SendFileActivity", "Killed process " + pid + " using port " + port);
-                        }
+    private void forceReleasePort() {
+        int port1 =FILE_TRANSFER_PORT;
+        try {
+            // Find and kill process using the port
+            Process process = Runtime.getRuntime().exec("lsof -i tcp:" + port1);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.contains("LISTEN")) {
+                    String[] parts = line.split("\\s+");
+                    if (parts.length > 1) {
+                        String pid = parts[1];
+                        Runtime.getRuntime().exec("kill -9 " + pid);
+                        FileLogger.log("ReceiveFileActivity", "Killed process " + pid + " using port " + port1);
                     }
                 }
-
-                // Wait briefly for port to be fully released
-                Thread.sleep(1000);
-            } catch (Exception e) {
-                FileLogger.log("SendFileActivity", "Error releasing port: " + port, e);
             }
+
+            // Wait briefly for port to be fully released
+            Thread.sleep(500);
+        } catch (Exception e) {
+            FileLogger.log("ReceiveFileActivity", "Error releasing port: " + port1, e);
         }
     }
     private void closeSocket() {
@@ -863,24 +875,35 @@ public class SendFileActivity extends AppCompatActivity {
         }
     }
 
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        closeSocket();
-        executorService.shutdown();
-    }
-
-    @Override
-    public void onBackPressed() {
-        super.onBackPressed();
-        // Close sockets on activity destruction
+    private void closeAllSockets() {
         try {
-            if (socket != null) {
+            // Close socket-related resources
+            if (dos != null) {
+                dos.close();
+                FileLogger.log("SendFileActivity", "DataOutputStream closed");
+            }
+            if (dis != null) {
+                dis.close();
+                FileLogger.log("SendFileActivity", "DataInputStream closed");
+            }
+            if (socket != null && !socket.isClosed()) {
                 socket.close();
                 FileLogger.log("SendFileActivity", "Socket closed");
             }
+
+            // Shutdown executor
+            executorService.shutdown();
+            FileLogger.log("SendFileActivity", "ExecutorService shutdown");
+
+            finish(); // Close the activity
         } catch (IOException e) {
-            FileLogger.log("SendFileActivity", "Error closing socket", e);
+            FileLogger.log("SendFileActivity", "Error closing sockets", e);
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        closeAllSockets();
     }
 }

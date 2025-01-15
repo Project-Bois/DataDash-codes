@@ -137,6 +137,10 @@ class ReceiveApp(QWidget):
         self.initUI()
         self.setFixedSize(853, 480)
         #com.an.Datadash
+        self.main_app = None
+        self.receive_app_p = None
+        self.receive_app_p_java = None
+        self.receive_app_p_swift = None
 
     def initUI(self):
         self.setWindowTitle('Receive File')
@@ -303,6 +307,47 @@ class ReceiveApp(QWidget):
         x = (screen.width() - window_width) // 2
         y = (screen.height() - window_height) // 2
         self.setGeometry(x, y, window_width, window_height)
+
+    def cleanup(self):
+        logger.info("Cleaning up ReceiveApp resources")
+        
+        # Stop all threads
+        if self.file_receiver:
+            self.file_receiver.broadcasting = False
+            self.file_receiver.terminate()
+            self.file_receiver.wait()
+
+        if self.broadcast_thread and self.broadcast_thread.is_alive():
+            self.broadcast_thread.join(timeout=1.0)
+
+        if self.config_manager:
+            self.config_manager.quit()
+            self.config_manager.wait()
+
+        # Close sockets
+        if hasattr(self.file_receiver, 'server_socket'):
+            try:
+                self.file_receiver.server_socket.close()
+            except:
+                pass
+
+        if hasattr(self.file_receiver, 'client_socket'):
+            try:
+                self.file_receiver.client_socket.close()
+            except:
+                pass
+
+        # Close child windows
+        for window in [self.main_app, self.receive_app_p, 
+                      self.receive_app_p_java, self.receive_app_p_swift]:
+            if window:
+                window.close()
+
+    def closeEvent(self, event):
+        logger.info("Shutting down ReceiveApp")
+        self.cleanup()
+        QApplication.quit()
+        event.accept()
 
     def closeEvent(self, event):
         logger.info("Shutting down ReceiveApp")
