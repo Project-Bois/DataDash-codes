@@ -80,6 +80,10 @@ class ReceiveWorkerJava(QThread):
         self.total_bytes_received = 0
         self.total_files = 0
         self.files_received = 0
+        self.total_folder_size = 0
+        self.total_received_bytes = 0
+        self.bytes_since_last_update = 0
+        self.last_speed_update_time = None
 
     def initialize_connection(self):
         """Initialize server socket with proper reuse settings"""
@@ -157,6 +161,9 @@ class ReceiveWorkerJava(QThread):
         is_folder_transfer = False
         self.start_time = time.time()
         self.last_update_time = time.time()
+        self.last_speed_update_time = time.time()
+        self.bytes_since_last_update = 0
+        self.files_received = 0  # Reset counter at start
         total_bytes = 0
         received_total = 0
         folder_received_bytes = 0
@@ -209,15 +216,14 @@ class ReceiveWorkerJava(QThread):
                     if file_name == 'metadata.json':
                         logger.debug("Receiving metadata file.")
                         self.metadata = self.receive_metadata(file_size)
-                        
-                        # Check if this is a folder transfer
-                        is_folder_transfer = any(file_info.get('path', '').endswith('/') 
-                                            for file_info in self.metadata)
-                        
+                        is_folder_transfer = any(file_info.get('path', '').endswith('/')
+                                                 for file_info in self.metadata)
                         if is_folder_transfer:
                             self.destination_folder = self.create_folder_structure(self.metadata)
                         else:
-                            self.destination_folder = self.config_manager.get_config()["save_to_directory"]
+                            default_dir = self.config_manager.get_config()["save_to_directory"]
+                            self.destination_folder = default_dir
+                        self.update_files_table_signal.emit(self.metadata)
                         continue
 
                     # Determine file path based on transfer type
@@ -251,33 +257,51 @@ class ReceiveWorkerJava(QThread):
                             remaining -= len(data)
                             received_total += len(data)
                             self.total_bytes_received = received_total
+                            self.total_received_bytes += len(data)
+                            self.bytes_since_last_update += len(data)
 
                             # Calculate transfer statistics every 0.5 seconds
-                            if current_time - self.last_update_time >= 0.5:
-                                elapsed = current_time - self.start_time
-                                if elapsed > 0:
-                                    speed = (received_size / (1024 * 1024)) / elapsed  # MB/s
-                                    eta = (file_size - received_size) / (received_size / elapsed) if received_size > 0 else 0
-                                else:
-                                    speed = 0
-                                    eta = 0
-                                self.transfer_stats_update.emit(speed, eta, elapsed)
-                                self.last_update_time = current_time
+                            if current_time - self.last_speed_update_time >= 0.5:
+                                elapsed_since_last = current_time - self.last_speed_update_time
+                                if elapsed_since_last > 0:
+                                    current_speed = (self.bytes_since_last_update / (1024 * 1024)) / elapsed_since_last
+                                    
+                                    # Calculate overall progress and ETA
+                                    overall_progress = self.total_received_bytes / self.total_folder_size
+                                    if current_speed > 0:
+                                        eta = (self.total_folder_size - self.total_received_bytes) / (current_speed * 1024 * 1024)
+                                    else:
+                                        eta = 0
+                                    
+                                    elapsed = current_time - self.start_time
+                                    self.transfer_stats_update.emit(current_speed, eta, elapsed)
+                                
+                                self.last_speed_update_time = current_time
+                                self.bytes_since_last_update = 0
 
-                            # Calculate and emit progress
-                            file_progress = int((received_size * 100) / file_size) if file_size > 0 else 0
-                            file_progress = min(file_progress, 100)
-                            self.file_progress_update.emit(os.path.basename(file_name), file_progress)
-                            
-                            # Overall progress can be implemented if needed
-                            self.progress_update.emit(file_progress)
+                            # For folder transfers, only update the overall folder progress
+                            if is_folder_transfer:
+                                folder_progress = int((self.total_received_bytes * 100) / self.total_folder_size)
+                                folder_progress = min(folder_progress, 100)
+                                self.progress_update.emit(folder_progress)
+                                self.file_progress_update.emit(self.base_folder_name, folder_progress)
+                            else:
+                                # For individual files, update file-specific progress
+                                file_progress = int((received_size * 100) / file_size) if file_size > 0 else 0
+                                file_progress = min(file_progress, 100)
+                                self.progress_update.emit(file_progress)
+                                self.file_progress_update.emit(os.path.basename(file_name), file_progress)
 
                     if encrypted_transfer:
                         self.encrypted_files.append(full_file_path)
 
-                    if file_name != 'metadata.json':
+                    # Update file counter only for actual files (not metadata.json, not directories, not .DS_Store)
+                    if (file_name != 'metadata.json' and 
+                        not file_name.endswith('/') and 
+                        not file_name.endswith('.DS_Store')):
                         self.files_received += 1
-                        files_pending = self.total_files - self.files_received
+                        files_pending = max(0, self.total_files - self.files_received)  # Ensure pending never goes negative
+                        logger.debug(f"File received: {file_name}, Total: {self.total_files}, Received: {self.files_received}, Pending: {files_pending}")
                         self.file_count_update.emit(self.total_files, self.files_received, files_pending)
 
                 except Exception as e:
@@ -307,25 +331,34 @@ class ReceiveWorkerJava(QThread):
             metadata_json = received_data.decode('utf-8')
             metadata = json.loads(metadata_json)
             
-            # Only emit the folder information if it's a folder transfer
-            if metadata and metadata[-1].get('base_folder_name', ''):
-                # Send only the folder metadata entry
-                self.update_files_table_signal.emit([metadata[-1]])
-            else:
-                # Send full metadata for individual files
-                self.update_files_table_signal.emit(metadata)
-                
-            # Count total files from metadata
-            if metadata and metadata[-1].get('base_folder_name', ''):
-                # For folder transfers, count all files (excluding folders and .delete)
-                self.total_files = sum(1 for item in metadata[:-1] 
-                                     if not item['path'].endswith('/') and item['path'] != '.delete')
-            else:
-                # For individual files
-                self.total_files = len(metadata)
-                
-            self.file_count_update.emit(self.total_files, 0, self.total_files)
+            # Filter out:
+            # 1. Empty dictionary entries
+            # 2. Directories (paths ending with /)
+            # 3. .DS_Store files
+            # 4. Entries without valid path or size
+            self.total_files = sum(
+                1 for info in metadata 
+                if isinstance(info, dict) and 
+                'path' in info and 
+                'size' in info and
+                info.get('size', 0) > 0 and  # Only count entries with size > 0
+                not info['path'].endswith('/') and  # Exclude directories
+                not info['path'].endswith('.DS_Store')  # Exclude .DS_Store files
+            )
             
+            # Calculate total folder size similarly, excluding .DS_Store files
+            self.total_folder_size = sum(
+                info.get('size', 0) 
+                for info in metadata 
+                if isinstance(info, dict) and 
+                'path' in info and 
+                'size' in info and
+                info.get('size', 0) > 0 and
+                not info['path'].endswith('/') and
+                not info['path'].endswith('.DS_Store')
+            )
+            
+            self.file_count_update.emit(self.total_files, 0, self.total_files)
             return metadata
             
         except UnicodeDecodeError as e:
@@ -726,6 +759,14 @@ class ReceiveAppPJava(QWidget):
 
     def update_file_progress(self, filename, progress):
         """Update progress for a specific file in the table"""
+        # For folder transfers, update the base folder progress
+        if self.files_table.rowCount() == 1:
+            progress_item = QTableWidgetItem()
+            progress_item.setData(Qt.ItemDataRole.UserRole, progress)
+            self.files_table.setItem(0, 3, progress_item)
+            return
+
+        # For individual files
         for row in range(self.files_table.rowCount()):
             if self.files_table.item(row, 1).text() == filename:
                 progress_item = QTableWidgetItem()
@@ -746,42 +787,101 @@ class ReceiveAppPJava(QWidget):
                 self.files_table.item(row, 1).setToolTip(new_name)
                 break
 
-    def update_files_table(self, metadata):
+    def update_files_table(self, files_info):
         """Update table with files from metadata"""
+        # Clear existing rows
         self.files_table.setRowCount(0)
-        sr_no = 1  # Initialize serial number counter
-        
-        for file_info in metadata:
-            if file_info.get('path') == '.delete':
-                continue
+
+        try:
+            # Check if this is a folder transfer by looking at the first entry's path
+            is_folder_transfer = False
+            base_folder_name = None
+            
+            # Get base folder name from the first entry with a path ending in '/'
+            for info in files_info:
+                if isinstance(info, dict) and 'path' in info and info['path'].endswith('/'):
+                    base_folder_name = info['path'].rstrip('/').split('/')[0]
+                    is_folder_transfer = True
+                    break
+
+            if is_folder_transfer and base_folder_name:
+                # Calculate total folder size from metadata
+                total_size = sum(
+                    info.get('size', 0) 
+                    for info in files_info 
+                    if isinstance(info, dict) and 
+                    'path' in info and 
+                    not info['path'].endswith('/')  # Exclude directories
+                )
                 
-            row = self.files_table.rowCount()
-            self.files_table.insertRow(row)
-            
-            sr_item = QTableWidgetItem(str(sr_no))
-            sr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.files_table.setItem(row, 0, sr_item)
-            
-            # File name
-            name_item = QTableWidgetItem(os.path.basename(file_info['path']))
-            self.files_table.setItem(row, 1, name_item)
-            
-            # Size
-            size = file_info.get('size', 2)
-            if size >= 1024 * 1024:  # MB
-                size_str = f"{size / (1024 * 1024):.2f} MB"
-            elif size >= 1024:  # KB 
-                size_str = f"{size / 1024:.2f} KB"
-            else:  # Bytes
-                size_str = f"{size} B"
-            self.files_table.setItem(row, 2, QTableWidgetItem(size_str))
-            
-            # Progress (initially 0)
-            progress_item = QTableWidgetItem()
-            progress_item.setData(Qt.ItemDataRole.UserRole, 0)
-            self.files_table.setItem(row, 3, progress_item)
-            
-            sr_no += 1  # Increment serial number
+                # Format size string
+                if total_size >= 1024 * 1024 * 1024:  # GB
+                    size_str = f"{total_size / (1024 * 1024 * 1024):.2f} GB"
+                elif total_size >= 1024 * 1024:  # MB
+                    size_str = f"{total_size / (1024 * 1024):.2f} MB"
+                elif total_size >= 1024:  # KB
+                    size_str = f"{total_size / 1024:.2f} KB"
+                else:  # Bytes
+                    size_str = f"{total_size} B"
+                
+                # Show the base folder in the table
+                self.files_table.insertRow(0)
+                
+                # Serial number
+                sr_item = QTableWidgetItem('1')
+                sr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.files_table.setItem(0, 0, sr_item)
+                
+                # Folder name with "📁" icon
+                name_item = QTableWidgetItem("📁 " + base_folder_name)
+                self.files_table.setItem(0, 1, name_item)
+                
+                # Size (now showing actual folder size)
+                size_item = QTableWidgetItem(size_str)
+                size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.files_table.setItem(0, 2, size_item)
+                
+                # Progress
+                progress_item = QTableWidgetItem()
+                progress_item.setData(Qt.ItemDataRole.UserRole, 0)
+                self.files_table.setItem(0, 3, progress_item)
+
+            else:
+                # Show individual files
+                for index, file_info in enumerate(files_info, 1):
+                    if not isinstance(file_info, dict) or 'path' not in file_info:
+                        continue
+                    
+                    row = self.files_table.rowCount()
+                    self.files_table.insertRow(row)
+                    
+                    # Serial number
+                    sr_item = QTableWidgetItem(str(index))
+                    sr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.files_table.setItem(row, 0, sr_item)
+                    
+                    # File name
+                    file_name = os.path.basename(file_info['path'])
+                    name_item = QTableWidgetItem(file_name)
+                    self.files_table.setItem(row, 1, name_item)
+                    
+                    # Size
+                    size = file_info.get('size', 0)
+                    if size >= 1024 * 1024:  # MB
+                        size_str = f"{size / (1024 * 1024):.2f} MB"
+                    elif size >= 1024:  # KB
+                        size_str = f"{size / 1024:.2f} KB"
+                    else:  # Bytes
+                        size_str = f"{size} B"
+                    self.files_table.setItem(row, 2, QTableWidgetItem(size_str))
+                    
+                    # Progress
+                    progress_item = QTableWidgetItem()
+                    progress_item.setData(Qt.ItemDataRole.UserRole, 0)
+                    self.files_table.setItem(row, 3, progress_item)
+
+        except Exception as e:
+            logger.error(f"Error updating files table: {str(e)}")
 
     def change_gif_to_success(self):
         self.receiving_movie.stop()
